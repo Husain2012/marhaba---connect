@@ -1,6 +1,7 @@
-import { FileText, Image as ImageIcon, Mic, Phone, Plus, Search, Users } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { FileText, Image as ImageIcon, Lock, Mic, Phone, Plus, Search, UserPlus, Users } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
 import { getCopy } from '../i18n/translations';
+import { searchDiscoverableUsers } from '../lib/chatService';
 import { Chat, ChatFilter, Language, UserPublic } from '../types/chat';
 import { Avatar } from './Avatar';
 
@@ -13,6 +14,7 @@ interface ChatListPaneProps {
   typingByChat: Record<string, Record<string, number>>;
   activeChatId: string | null;
   onSelectChat: (chatId: string) => void;
+  onStartDirectChatWithUser: (peer: UserPublic) => void;
   onOpenNewChat: () => void;
 }
 
@@ -42,11 +44,43 @@ export function ChatListPane({
   typingByChat,
   activeChatId,
   onSelectChat,
+  onStartDirectChatWithUser,
   onOpenNewChat,
 }: ChatListPaneProps) {
   const t = getCopy(language);
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<ChatFilter>('all');
+  const [searchResults, setSearchResults] = useState<UserPublic[]>([]);
+  const [searching, setSearching] = useState(false);
+
+  useEffect(() => {
+    const q = search.trim();
+    if (q.length < 2) {
+      setSearchResults([]);
+      setSearching(false);
+      return;
+    }
+
+    let cancelled = false;
+    setSearching(true);
+    const timer = window.setTimeout(async () => {
+      try {
+        const found = await searchDiscoverableUsers(q, currentUid);
+        if (!cancelled) {
+          setSearchResults(found);
+        }
+      } finally {
+        if (!cancelled) {
+          setSearching(false);
+        }
+      }
+    }, 260);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [currentUid, search]);
 
   const filteredChats = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -65,6 +99,23 @@ export function ChatListPane({
       );
     });
   }, [chats, contactsMap, currentUid, filter, search, t.newChat]);
+
+  const existingPeerUids = useMemo(() => {
+    const set = new Set<string>();
+    for (const c of chats) {
+      if (c.type === 'direct') {
+        for (const id of c.memberIds) {
+          if (id !== currentUid) set.add(id);
+        }
+      }
+    }
+    return set;
+  }, [chats, currentUid]);
+
+  const discoverMatches = useMemo(
+    () => searchResults.filter((u) => !existingPeerUids.has(u.uid)),
+    [existingPeerUids, searchResults]
+  );
 
   return (
     <div className="flex flex-col h-full bg-white dark:bg-[#111822]">
@@ -116,7 +167,7 @@ export function ChatListPane({
       </div>
 
       <div className="flex-1 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800/70">
-        {filteredChats.length === 0 ? (
+        {filteredChats.length === 0 && search.trim().length < 2 ? (
           <div className="p-8 text-center space-y-3">
             <p className="text-sm text-slate-500 dark:text-slate-400 leading-relaxed">
               {t.noChatsList}
@@ -138,6 +189,11 @@ export function ChatListPane({
             const isOnline = !isGroup && onlineUids.includes(peerUid);
             const isSelected = activeChatId === chat.id;
             const typingSenders = Object.keys(typingByChat[chat.id] || {}).filter((id) => id !== currentUid);
+
+            const previewLabel =
+              chat.lastMessageText === '🔒'
+                ? t.e2eeEncryptedPreview
+                : chat.lastMessageText || (isGroup ? `${chat.memberIds.length} ${t.membersLabel}` : t.startChat);
 
             return (
               <button
@@ -174,13 +230,12 @@ export function ChatListPane({
                       <span className="text-[#00B87C] font-medium truncate">{t.typing}</span>
                     ) : (
                       <>
+                        {chat.lastMessageText === '🔒' && <Lock className="w-3 h-3 text-[#00B87C] shrink-0" />}
                         {chat.lastMessageType === 'audio' && <Mic className="w-3.5 h-3.5 text-[#007AFF] shrink-0" />}
                         {chat.lastMessageType === 'image' && <ImageIcon className="w-3.5 h-3.5 text-[#007AFF] shrink-0" />}
                         {chat.lastMessageType === 'file' && <FileText className="w-3.5 h-3.5 text-[#007AFF] shrink-0" />}
                         {chat.lastMessageType === 'call' && <Phone className="w-3.5 h-3.5 text-[#00B87C] shrink-0" />}
-                        <span className="truncate">
-                          {chat.lastMessageText || (isGroup ? `${chat.memberIds.length} ${t.membersLabel}` : t.startChat)}
-                        </span>
+                        <span className="truncate">{previewLabel}</span>
                       </>
                     )}
                   </div>
@@ -188,6 +243,50 @@ export function ChatListPane({
               </button>
             );
           })
+        )}
+
+        {/* Search results for new conversations when typing >= 2 chars */}
+        {search.trim().length >= 2 && (
+          <div className="bg-slate-50/70 dark:bg-[#0E151E]">
+            <div className="px-4 py-2 text-[11px] font-semibold text-slate-500 dark:text-slate-400">
+              {searching ? t.searching : t.searchResultsTitle}
+            </div>
+            {!searching && discoverMatches.length === 0 && filteredChats.length === 0 ? (
+              <div className="px-4 py-4 text-xs text-slate-500 dark:text-slate-400">
+                {t.noSearchResults}
+              </div>
+            ) : (
+              discoverMatches.map((peer) => (
+                <button
+                  key={peer.uid}
+                  type="button"
+                  onClick={() => {
+                    setSearch('');
+                    onStartDirectChatWithUser(peer);
+                  }}
+                  className="w-full px-4 py-3 min-h-[62px] flex items-center justify-between gap-3 hover:bg-slate-100 dark:hover:bg-[#16202D] text-start transition-colors"
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <Avatar
+                      name={peer.displayName}
+                      photoURL={peer.photoURL}
+                      isOnline={onlineUids.includes(peer.uid)}
+                      size="sm"
+                    />
+                    <div className="min-w-0">
+                      <div className="text-sm font-semibold text-slate-900 dark:text-white truncate">
+                        {peer.displayName}
+                      </div>
+                      <div className="text-[11px] font-mono text-slate-500 dark:text-slate-400 truncate">
+                        {peer.connectCode}
+                      </div>
+                    </div>
+                  </div>
+                  <UserPlus className="w-4 h-4 text-[#007AFF] shrink-0" />
+                </button>
+              ))
+            )}
+          </div>
         )}
       </div>
     </div>

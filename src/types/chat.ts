@@ -11,6 +11,9 @@ export interface UserPublic {
   displayName: string;
   photoURL: string;
   bio: string;
+  connectCode: string;
+  e2eeKeyX: string;
+  e2eeKeyY: string;
   isOnline: boolean;
   isDiscoverable: boolean;
   language: Language;
@@ -23,6 +26,15 @@ export interface UserPrivate {
   uid: string;
   email: string;
   phone: string;
+  updatedAt: number;
+}
+
+export interface UserContact {
+  uid: string;
+  displayName: string;
+  photoURL: string;
+  bio: string;
+  addedAt: number;
   updatedAt: number;
 }
 
@@ -48,6 +60,13 @@ export interface ChatMessage {
   memberIds: string[];
   type: MessageType;
   text: string;
+  isEncrypted: boolean;
+  ciphertext: string;
+  iv: string;
+  senderKeyX: string;
+  senderKeyY: string;
+  recipientKeyX: string;
+  recipientKeyY: string;
   mediaUrl: string;
   fileName: string;
   fileSize: number;

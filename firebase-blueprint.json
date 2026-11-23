@@ -24,6 +24,19 @@
           "type": "string",
           "maxLength": 160
         },
+        "connectCode": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 24
+        },
+        "e2eeKeyX": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "e2eeKeyY": {
+          "type": "string",
+          "maxLength": 128
+        },
         "isOnline": {
           "type": "boolean"
         },
@@ -52,6 +65,9 @@
         "displayName",
         "photoURL",
         "bio",
+        "connectCode",
+        "e2eeKeyX",
+        "e2eeKeyY",
         "isOnline",
         "isDiscoverable",
         "language",
@@ -86,6 +102,41 @@
         }
       },
       "required": ["uid", "email", "phone", "updatedAt"]
+    },
+    "UserContact": {
+      "title": "UserContact",
+      "description": "Personal saved contact entry private to the owning user.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "photoURL": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "bio": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "addedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "displayName", "photoURL", "bio", "addedAt", "updatedAt"]
     },
     "Chat": {
       "title": "Chat",
@@ -186,7 +237,7 @@
     },
     "Message": {
       "title": "Message",
-      "description": "Instant message inside a chat (text, voice note, image, file, or call log).",
+      "description": "Instant message inside a chat with optional end-to-end encrypted payload.",
       "type": "object",
       "properties": {
         "id": {
@@ -223,6 +274,33 @@
         "text": {
           "type": "string",
           "maxLength": 4000
+        },
+        "isEncrypted": {
+          "type": "boolean"
+        },
+        "ciphertext": {
+          "type": "string",
+          "maxLength": 8000
+        },
+        "iv": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "senderKeyX": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "senderKeyY": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "recipientKeyX": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "recipientKeyY": {
+          "type": "string",
+          "maxLength": 128
         },
         "mediaUrl": {
           "type": "string",
@@ -271,6 +349,13 @@
         "memberIds",
         "type",
         "text",
+        "isEncrypted",
+        "ciphertext",
+        "iv",
+        "senderKeyX",
+        "senderKeyY",
+        "recipientKeyX",
+        "recipientKeyY",
         "mediaUrl",
         "fileName",
         "fileSize",
@@ -365,11 +450,15 @@
   "firestore": {
     "/users/{userId}": {
       "schema": { "$ref": "#/entities/UserPublic" },
-      "description": "Public contact directory profile without PII."
+      "description": "Public discoverable profile with E2EE public key coordinates."
     },
     "/users/{userId}/private/{docId}": {
       "schema": { "$ref": "#/entities/UserPrivate" },
       "description": "Isolated PII document accessible only to the owning user."
+    },
+    "/users/{userId}/contacts/{contactUid}": {
+      "schema": { "$ref": "#/entities/UserContact" },
+      "description": "Private per-user saved contacts list."
     },
     "/chats/{chatId}": {
       "schema": { "$ref": "#/entities/Chat" },

@@ -7,6 +7,7 @@ import {
   FileText,
   Image as ImageIcon,
   Info,
+  Lock,
   Mic,
   Paperclip,
   Pause,
@@ -19,9 +20,10 @@ import {
   Video,
   X,
 } from 'lucide-react';
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { getCopy } from '../i18n/translations';
 import { sendChatMessage, uploadMediaFile } from '../lib/chatService';
+import { decryptDirectText, E2eeKeyPairData, encryptDirectText } from '../lib/e2ee';
 import { CallType, Chat, ChatMessage, Language, UserPublic } from '../types/chat';
 import { Avatar } from './Avatar';
 
@@ -30,6 +32,7 @@ interface ChatThreadPaneProps {
   theme: 'light' | 'dark';
   currentUid: string;
   currentDisplayName: string;
+  myE2eeKeys: E2eeKeyPairData | null;
   getIdToken: () => Promise<string>;
   chat: Chat | null;
   messages: ChatMessage[];
@@ -125,6 +128,7 @@ export function ChatThreadPane({
   theme,
   currentUid,
   currentDisplayName,
+  myE2eeKeys,
   getIdToken,
   chat,
   messages,
@@ -137,13 +141,14 @@ export function ChatThreadPane({
 }: ChatThreadPaneProps) {
   const t = getCopy(language);
   const [draft, setDraft] = useState('');
-  const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
+  const [replyTo, setReplyTo] = useState<(ChatMessage & { displayText: string }) | null>(null);
   const [showEmoji, setShowEmoji] = useState(false);
   const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
   const [lightboxImage, setLightboxImage] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [decryptedMap, setDecryptedMap] = useState<Record<string, string | null>>({});
 
   // Voice recording state
   const [recording, setRecording] = useState(false);
@@ -157,6 +162,45 @@ export function ChatThreadPane({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const typingTimeoutRef = useRef<number | null>(null);
+
+  // Decrypt end-to-end encrypted messages locally
+  useEffect(() => {
+    if (!myE2eeKeys) return;
+    let cancelled = false;
+
+    const run = async () => {
+      const updates: Record<string, string | null> = {};
+      for (const msg of messages) {
+        if (msg.isEncrypted && msg.ciphertext && !(msg.id in decryptedMap)) {
+          const plain = await decryptDirectText(msg, currentUid, myE2eeKeys);
+          updates[msg.id] = plain;
+        }
+      }
+      if (!cancelled && Object.keys(updates).length > 0) {
+        setDecryptedMap((prev) => ({ ...prev, ...updates }));
+      }
+    };
+
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentUid, decryptedMap, messages, myE2eeKeys]);
+
+  const resolvedMessages = useMemo(() => {
+    const byId = new Map<string, string>();
+    const list = messages.map((msg) => {
+      const displayText = msg.isEncrypted
+        ? decryptedMap[msg.id] ?? (msg.id in decryptedMap ? t.e2eeLockedHint : '...')
+        : msg.text;
+      byId.set(msg.id, displayText || msg.fileName || msg.type);
+      return { ...msg, displayText };
+    });
+    return list.map((msg) => ({
+      ...msg,
+      resolvedReplyPreview: msg.replyToId ? byId.get(msg.replyToId) || msg.replyToPreview : msg.replyToPreview,
+    }));
+  }, [decryptedMap, messages, t.e2eeLockedHint]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -196,6 +240,7 @@ export function ChatThreadPane({
   const peer = contactsMap[peerUid];
   const headerTitle = isGroup ? chat.name || t.groupChat : peer?.displayName || t.newChat;
   const isPeerOnline = !isGroup && onlineUids.includes(peerUid);
+  const canE2ee = !isGroup && Boolean(myE2eeKeys && peer?.e2eeKeyX && peer?.e2eeKeyY);
 
   const handleTextChange = (val: string) => {
     setDraft(val);
@@ -216,13 +261,28 @@ export function ChatThreadPane({
     const currentReply = replyTo;
     setReplyTo(null);
 
-    await sendChatMessage(chat.id, currentUid, currentDisplayName, chat.memberIds, {
-      type: 'text',
-      text: clean,
-      replyToId: currentReply?.id || '',
-      replyToPreview: currentReply ? (currentReply.text || currentReply.fileName || currentReply.type).slice(0, 140) : '',
-      previewLabel: clean,
-    });
+    if (canE2ee && myE2eeKeys && peer) {
+      const encrypted = await encryptDirectText(clean, myE2eeKeys, peer.e2eeKeyX, peer.e2eeKeyY);
+      await sendChatMessage(chat.id, currentUid, currentDisplayName, chat.memberIds, {
+        type: 'text',
+        isEncrypted: true,
+        ciphertext: encrypted.ciphertext,
+        iv: encrypted.iv,
+        senderKeyX: encrypted.senderKeyX,
+        senderKeyY: encrypted.senderKeyY,
+        recipientKeyX: encrypted.recipientKeyX,
+        recipientKeyY: encrypted.recipientKeyY,
+        replyToId: currentReply?.id || '',
+      });
+    } else {
+      await sendChatMessage(chat.id, currentUid, currentDisplayName, chat.memberIds, {
+        type: 'text',
+        text: clean,
+        replyToId: currentReply?.id || '',
+        replyToPreview: currentReply ? (currentReply.displayText || currentReply.fileName || currentReply.type).slice(0, 140) : '',
+        previewLabel: clean,
+      });
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -371,8 +431,9 @@ export function ChatThreadPane({
             />
 
             <div className="min-w-0">
-              <h3 className="font-display font-bold text-sm sm:text-base text-slate-900 dark:text-white truncate">
-                {headerTitle}
+              <h3 className="font-display font-bold text-sm sm:text-base text-slate-900 dark:text-white truncate flex items-center gap-1.5">
+                <span className="truncate">{headerTitle}</span>
+                {canE2ee && <Lock className="w-3.5 h-3.5 text-[#00B87C] shrink-0" />}
               </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400 truncate">
                 {typingSenders.length > 0 ? (
@@ -380,9 +441,14 @@ export function ChatThreadPane({
                 ) : isGroup ? (
                   `${chat.memberIds.length} ${t.membersLabel}`
                 ) : isPeerOnline ? (
-                  <span className="text-[#00B87C] font-medium">{t.online}</span>
+                  <span className="text-[#00B87C] font-medium">
+                    {t.online} · {t.e2eeBadge}
+                  </span>
                 ) : (
-                  t.offline
+                  <span>
+                    {t.offline}
+                    {canE2ee ? ` · ${t.e2eeBadge}` : ''}
+                  </span>
                 )}
               </p>
             </div>
@@ -448,7 +514,16 @@ export function ChatThreadPane({
               : undefined
           }
         >
-          {messages.map((msg) => {
+          {canE2ee && (
+            <div className="flex justify-center pb-2">
+              <div className="px-4 py-2 rounded-xl bg-white/90 dark:bg-[#16202D]/90 border border-slate-200 dark:border-slate-800 text-xs text-slate-600 dark:text-slate-300 flex items-center gap-2 max-w-md text-center">
+                <Lock className="w-3.5 h-3.5 text-[#00B87C] shrink-0" />
+                <span>{t.e2eeInfoNote}</span>
+              </div>
+            </div>
+          )}
+
+          {resolvedMessages.map((msg) => {
             const isMine = msg.senderId === currentUid;
             const isReadByPeer = msg.readBy.length > 1;
             const timeStr = new Date(msg.createdAt).toLocaleTimeString(
@@ -499,7 +574,7 @@ export function ChatThreadPane({
                       </div>
                     )}
 
-                    {msg.replyToPreview && (
+                    {msg.resolvedReplyPreview && (
                       <div
                         className={`mb-2 px-2.5 py-1.5 rounded-lg text-xs truncate ${
                           isMine
@@ -507,7 +582,7 @@ export function ChatThreadPane({
                             : 'bg-slate-100 dark:bg-[#1D2A3B] text-slate-600 dark:text-slate-300'
                         }`}
                       >
-                        {msg.replyToPreview}
+                        {msg.resolvedReplyPreview}
                       </div>
                     )}
 
@@ -551,9 +626,9 @@ export function ChatThreadPane({
                       </a>
                     )}
 
-                    {msg.text && (
+                    {msg.displayText && (
                       <p className="text-sm sm:text-[15px] leading-relaxed whitespace-pre-wrap break-words">
-                        {msg.text}
+                        {msg.displayText}
                       </p>
                     )}
 
@@ -562,6 +637,7 @@ export function ChatThreadPane({
                         isMine ? 'text-white/80' : 'text-slate-400 dark:text-slate-500'
                       }`}
                     >
+                      {msg.isEncrypted && <Lock className="w-2.5 h-2.5 opacity-80" />}
                       <time>{timeStr}</time>
                       {isMine &&
                         (isReadByPeer ? (
@@ -600,7 +676,7 @@ export function ChatThreadPane({
               <div className="min-w-0 flex items-center gap-2 text-slate-600 dark:text-slate-300">
                 <Reply className="w-4 h-4 text-[#007AFF] shrink-0" />
                 <span className="font-semibold shrink-0">{t.replyingTo}:</span>
-                <span className="truncate">{replyTo.text || replyTo.fileName || replyTo.type}</span>
+                <span className="truncate">{replyTo.displayText || replyTo.fileName || replyTo.type}</span>
               </div>
             ) : null}
 
@@ -788,6 +864,12 @@ export function ChatThreadPane({
             </div>
             {!isGroup && peer?.bio && (
               <p className="text-xs text-slate-500 dark:text-slate-400">{peer.bio}</p>
+            )}
+            {canE2ee && (
+              <p className="text-[11px] text-[#00B87C] flex items-center gap-1 pt-1">
+                <Lock className="w-3 h-3" />
+                <span>{t.e2eeBadge}</span>
+              </p>
             )}
           </div>
 

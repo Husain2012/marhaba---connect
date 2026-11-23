@@ -2,8 +2,11 @@ import { User } from 'firebase/auth';
 import {
   arrayUnion,
   collection,
+  deleteDoc,
   doc,
   getDoc,
+  getDocs,
+  limit,
   onSnapshot,
   query,
   serverTimestamp,
@@ -20,9 +23,11 @@ import {
   ChatMessage,
   Language,
   MessageType,
+  UserContact,
   UserPrivate,
   UserPublic,
 } from '../types/chat';
+import { E2eeKeyPairData } from './e2ee';
 import { db, handleFirestoreError, OperationType } from './firebase';
 
 function toMillis(val: unknown): number {
@@ -41,9 +46,10 @@ function sanitizeId(raw: string): string {
 }
 
 export function generateId(prefix: string): string {
-  const rand = typeof crypto !== 'undefined' && crypto.randomUUID
-    ? crypto.randomUUID().replace(/-/g, '')
-    : `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  const rand =
+    typeof crypto !== 'undefined' && crypto.randomUUID
+      ? crypto.randomUUID().replace(/-/g, '')
+      : `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
   return sanitizeId(`${prefix}_${rand}`);
 }
 
@@ -52,11 +58,39 @@ export function makeDirectChatId(uid1: string, uid2: string): string {
   return `direct_${sorted[0]}_${sorted[1]}`;
 }
 
-export async function syncUserProfile(user: User, language: Language): Promise<void> {
+export function makeConnectCode(uid: string): string {
+  const clean = uid.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+  return `MC-${clean.slice(0, 6) || 'USER01'}`;
+}
+
+function mapUserPublic(id: string, data: Record<string, unknown>): UserPublic {
+  return {
+    uid: String(data.uid || id),
+    displayName: String(data.displayName || 'User'),
+    photoURL: String(data.photoURL || ''),
+    bio: String(data.bio || ''),
+    connectCode: String(data.connectCode || makeConnectCode(id)),
+    e2eeKeyX: String(data.e2eeKeyX || ''),
+    e2eeKeyY: String(data.e2eeKeyY || ''),
+    isOnline: Boolean(data.isOnline),
+    isDiscoverable: Boolean(data.isDiscoverable),
+    language: data.language === 'en' ? 'en' : 'ar',
+    lastSeen: toMillis(data.lastSeen),
+    createdAt: toMillis(data.createdAt),
+    updatedAt: toMillis(data.updatedAt),
+  };
+}
+
+export async function syncUserProfile(
+  user: User,
+  language: Language,
+  e2eeKeys: E2eeKeyPairData
+): Promise<void> {
   const userRef = doc(db, 'users', user.uid);
   const privateRef = doc(db, 'users', user.uid, 'private', 'info');
   const displayName = (user.displayName || user.email?.split('@')[0] || 'User').trim().slice(0, 80);
   const photoURL = (user.photoURL || '').slice(0, 512);
+  const connectCode = makeConnectCode(user.uid);
 
   try {
     const snap = await getDoc(userRef);
@@ -66,6 +100,9 @@ export async function syncUserProfile(user: User, language: Language): Promise<v
         displayName,
         photoURL,
         bio: language === 'ar' ? 'متاح على مرحبا كونكت' : 'Available on Marhaba Connect',
+        connectCode,
+        e2eeKeyX: e2eeKeys.publicKeyX.slice(0, 128),
+        e2eeKeyY: e2eeKeys.publicKeyY.slice(0, 128),
         isOnline: true,
         isDiscoverable: true,
         language,
@@ -74,11 +111,27 @@ export async function syncUserProfile(user: User, language: Language): Promise<v
         updatedAt: serverTimestamp(),
       });
     } else {
-      await updateDoc(userRef, {
-        isOnline: true,
-        lastSeen: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+      const existingData = snap.data();
+      // Backfill connectCode / E2EE key coords cleanly on older profiles
+      await setDoc(
+        userRef,
+        {
+          uid: user.uid,
+          displayName: String(existingData.displayName || displayName).slice(0, 80),
+          photoURL: String(existingData.photoURL ?? photoURL).slice(0, 512),
+          bio: String(existingData.bio ?? '').slice(0, 160),
+          connectCode: String(existingData.connectCode || connectCode).slice(0, 24),
+          e2eeKeyX: e2eeKeys.publicKeyX.slice(0, 128),
+          e2eeKeyY: e2eeKeys.publicKeyY.slice(0, 128),
+          isOnline: true,
+          isDiscoverable: existingData.isDiscoverable !== false,
+          language: existingData.language === 'en' ? 'en' : 'ar',
+          lastSeen: serverTimestamp(),
+          createdAt: existingData.createdAt || serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
     }
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`);
@@ -150,6 +203,20 @@ export async function updateUserPrivatePhone(uid: string, email: string, phone: 
   }
 }
 
+export function subscribeMyProfile(uid: string, onChange: (user: UserPublic | null) => void): () => void {
+  return onSnapshot(
+    doc(db, 'users', uid),
+    (snap) => {
+      if (!snap.exists()) {
+        onChange(null);
+        return;
+      }
+      onChange(mapUserPublic(snap.id, snap.data()));
+    },
+    (err) => handleFirestoreError(err, OperationType.GET, `users/${uid}`)
+  );
+}
+
 export function subscribeMyPrivateInfo(uid: string, onChange: (info: UserPrivate | null) => void): () => void {
   const path = `users/${uid}/private/info`;
   return onSnapshot(
@@ -171,31 +238,97 @@ export function subscribeMyPrivateInfo(uid: string, onChange: (info: UserPrivate
   );
 }
 
-export function subscribeContacts(onChange: (users: UserPublic[]) => void): () => void {
-  const q = query(collection(db, 'users'), where('isDiscoverable', '==', true));
+export function subscribeMyContacts(uid: string, onChange: (contacts: UserContact[]) => void): () => void {
+  const path = `users/${uid}/contacts`;
   return onSnapshot(
-    q,
+    collection(db, 'users', uid, 'contacts'),
     (snapshot) => {
-      const list: UserPublic[] = snapshot.docs.map((d) => {
+      const list: UserContact[] = snapshot.docs.map((d) => {
         const data = d.data();
         return {
           uid: String(data.uid || d.id),
           displayName: String(data.displayName || 'User'),
           photoURL: String(data.photoURL || ''),
           bio: String(data.bio || ''),
-          isOnline: Boolean(data.isOnline),
-          isDiscoverable: Boolean(data.isDiscoverable),
-          language: data.language === 'en' ? 'en' : 'ar',
-          lastSeen: toMillis(data.lastSeen),
-          createdAt: toMillis(data.createdAt),
+          addedAt: toMillis(data.addedAt),
           updatedAt: toMillis(data.updatedAt),
         };
       });
       list.sort((a, b) => a.displayName.localeCompare(b.displayName));
       onChange(list);
     },
-    (err) => handleFirestoreError(err, OperationType.LIST, 'users')
+    (err) => handleFirestoreError(err, OperationType.LIST, path)
   );
+}
+
+export async function saveUserContact(myUid: string, peer: UserPublic): Promise<void> {
+  if (!peer.uid || peer.uid === myUid) return;
+  const ref = doc(db, 'users', myUid, 'contacts', peer.uid);
+  try {
+    const snap = await getDoc(ref);
+    if (!snap.exists()) {
+      await setDoc(ref, {
+        uid: peer.uid,
+        displayName: peer.displayName.slice(0, 80) || 'User',
+        photoURL: peer.photoURL.slice(0, 512),
+        bio: peer.bio.slice(0, 160),
+        addedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      await updateDoc(ref, {
+        displayName: peer.displayName.slice(0, 80) || 'User',
+        photoURL: peer.photoURL.slice(0, 512),
+        bio: peer.bio.slice(0, 160),
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, `users/${myUid}/contacts/${peer.uid}`);
+  }
+}
+
+export async function removeUserContact(myUid: string, contactUid: string): Promise<void> {
+  try {
+    await deleteDoc(doc(db, 'users', myUid, 'contacts', contactUid));
+  } catch (err) {
+    handleFirestoreError(err, OperationType.DELETE, `users/${myUid}/contacts/${contactUid}`);
+  }
+}
+
+export async function fetchUserProfileByUid(uid: string): Promise<UserPublic | null> {
+  try {
+    const snap = await getDoc(doc(db, 'users', uid));
+    if (!snap.exists()) return null;
+    return mapUserPublic(snap.id, snap.data());
+  } catch {
+    return null;
+  }
+}
+
+export async function searchDiscoverableUsers(queryText: string, currentUid: string): Promise<UserPublic[]> {
+  const qNorm = queryText.trim().toLowerCase();
+  if (qNorm.length < 2) return [];
+
+  try {
+    const q = query(collection(db, 'users'), where('isDiscoverable', '==', true), limit(50));
+    const snapshot = await getDocs(q);
+    const matches: UserPublic[] = [];
+    for (const d of snapshot.docs) {
+      if (d.id === currentUid) continue;
+      const user = mapUserPublic(d.id, d.data());
+      if (
+        user.displayName.toLowerCase().includes(qNorm) ||
+        user.connectCode.toLowerCase().includes(qNorm)
+      ) {
+        matches.push(user);
+      }
+      if (matches.length >= 12) break;
+    }
+    return matches;
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, 'users');
+  }
 }
 
 export function subscribeChats(uid: string, onChange: (chats: Chat[]) => void): () => void {
@@ -241,6 +374,13 @@ export function subscribeMessages(chatId: string, uid: string, onChange: (msgs: 
           memberIds: Array.isArray(data.memberIds) ? data.memberIds.map(String) : [],
           type: (data.type || 'text') as MessageType,
           text: String(data.text || ''),
+          isEncrypted: Boolean(data.isEncrypted),
+          ciphertext: String(data.ciphertext || ''),
+          iv: String(data.iv || ''),
+          senderKeyX: String(data.senderKeyX || ''),
+          senderKeyY: String(data.senderKeyY || ''),
+          recipientKeyX: String(data.recipientKeyX || ''),
+          recipientKeyY: String(data.recipientKeyY || ''),
           mediaUrl: String(data.mediaUrl || ''),
           fileName: String(data.fileName || ''),
           fileSize: Number(data.fileSize || 0),
@@ -370,6 +510,13 @@ export async function sendChatMessage(
   payload: {
     type: MessageType;
     text?: string;
+    isEncrypted?: boolean;
+    ciphertext?: string;
+    iv?: string;
+    senderKeyX?: string;
+    senderKeyY?: string;
+    recipientKeyX?: string;
+    recipientKeyY?: string;
     mediaUrl?: string;
     fileName?: string;
     fileSize?: number;
@@ -381,10 +528,13 @@ export async function sendChatMessage(
   }
 ): Promise<void> {
   const messageId = generateId('msg');
-  const cleanText = (payload.text || '').trim().slice(0, 4000);
+  const isEncrypted = Boolean(payload.isEncrypted);
+  const cleanText = isEncrypted ? '' : (payload.text || '').trim().slice(0, 4000);
   const cleanName = senderName.trim().slice(0, 80) || 'User';
   const boundedMembers = memberIds.slice(0, 50);
-  const previewText = (payload.previewLabel || cleanText || payload.fileName || payload.type).slice(0, 500);
+  const previewText = isEncrypted
+    ? '🔒'
+    : (payload.previewLabel || cleanText || payload.fileName || payload.type).slice(0, 500);
 
   try {
     await setDoc(doc(db, 'chats', chatId, 'messages', messageId), {
@@ -395,13 +545,20 @@ export async function sendChatMessage(
       memberIds: boundedMembers,
       type: payload.type,
       text: cleanText,
+      isEncrypted,
+      ciphertext: (payload.ciphertext || '').slice(0, 8000),
+      iv: (payload.iv || '').slice(0, 64),
+      senderKeyX: (payload.senderKeyX || '').slice(0, 128),
+      senderKeyY: (payload.senderKeyY || '').slice(0, 128),
+      recipientKeyX: (payload.recipientKeyX || '').slice(0, 128),
+      recipientKeyY: (payload.recipientKeyY || '').slice(0, 128),
       mediaUrl: (payload.mediaUrl || '').slice(0, 512),
       fileName: (payload.fileName || '').slice(0, 180),
       fileSize: Math.max(0, Math.min(26214400, Number(payload.fileSize || 0))),
       mimeType: (payload.mimeType || '').slice(0, 120),
       audioDurationSec: Math.max(0, Math.min(3600, Math.round(Number(payload.audioDurationSec || 0)))),
       replyToId: (payload.replyToId || '').slice(0, 128),
-      replyToPreview: (payload.replyToPreview || '').slice(0, 160),
+      replyToPreview: isEncrypted ? '' : (payload.replyToPreview || '').slice(0, 160),
       readBy: [senderId],
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),

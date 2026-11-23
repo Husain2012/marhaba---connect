@@ -15,16 +15,20 @@ import { useRealtimeSignaling } from './hooks/useRealtimeSignaling';
 import { getCopy } from './i18n/translations';
 import {
   createGroupChat,
+  fetchUserProfileByUid,
   getOrCreateDirectChat,
   markMessagesAsRead,
+  saveUserContact,
   subscribeCalls,
   subscribeChats,
-  subscribeContacts,
   subscribeMessages,
+  subscribeMyContacts,
   subscribeMyPrivateInfo,
+  subscribeMyProfile,
   syncUserProfile,
   updateUserProfile,
 } from './lib/chatService';
+import { E2eeKeyPairData, getOrCreateMyE2eeKeys } from './lib/e2ee';
 import { auth, googleProvider } from './lib/firebase';
 import {
   CallRecord,
@@ -34,6 +38,7 @@ import {
   Language,
   NavTab,
   ThemeMode,
+  UserContact,
   UserPrivate,
   UserPublic,
 } from './types/chat';
@@ -52,10 +57,13 @@ function MainApp() {
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [myE2eeKeys, setMyE2eeKeys] = useState<E2eeKeyPairData | null>(null);
 
   const [activeTab, setActiveTab] = useState<NavTab>('chats');
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
-  const [contacts, setContacts] = useState<UserPublic[]>([]);
+  const [myProfile, setMyProfile] = useState<UserPublic | null>(null);
+  const [myContacts, setMyContacts] = useState<UserContact[]>([]);
+  const [peerProfilesMap, setPeerProfilesMap] = useState<Record<string, UserPublic>>({});
   const [privateInfo, setPrivateInfo] = useState<UserPrivate | null>(null);
   const [chats, setChats] = useState<Chat[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -69,14 +77,12 @@ function MainApp() {
 
   const t = getCopy(language);
 
-  // Sync HTML direction & language
   useEffect(() => {
     document.documentElement.dir = language === 'ar' ? 'rtl' : 'ltr';
     document.documentElement.lang = language;
     localStorage.setItem('marhaba_lang', language);
   }, [language]);
 
-  // Sync Tailwind dark class
   useEffect(() => {
     if (theme === 'dark') {
       document.documentElement.classList.add('dark');
@@ -93,41 +99,109 @@ function MainApp() {
     }, 3500);
   }, []);
 
-  // Auth listener
+  // Auth listener with full state reset per user
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (nextUser) => {
+      // Immediately clear previous user's state on any auth transition
+      setChats([]);
+      setMessages([]);
+      setCalls([]);
+      setMyProfile(null);
+      setMyContacts([]);
+      setPeerProfilesMap({});
+      setPrivateInfo(null);
+      setActiveChatId(null);
+      setMyE2eeKeys(null);
+
       setUser(nextUser);
       setAuthReady(true);
+
       if (nextUser) {
-        await syncUserProfile(nextUser, language).catch(() => undefined);
-      } else {
-        setChats([]);
-        setMessages([]);
-        setCalls([]);
-        setContacts([]);
-        setPrivateInfo(null);
-        setActiveChatId(null);
+        const keys = await getOrCreateMyE2eeKeys(nextUser.uid);
+        setMyE2eeKeys(keys);
+        await syncUserProfile(nextUser, language, keys).catch(() => undefined);
       }
     });
     return () => unsub();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Subscribe to Firestore collections once authenticated
+  // Subscribe ONLY to the signed-in user's own profile, private info, saved contacts, chats, and calls
   useEffect(() => {
     if (!authReady || !user) return;
-    const unsubContacts = subscribeContacts(setContacts);
+    const unsubProfile = subscribeMyProfile(user.uid, setMyProfile);
+    const unsubContacts = subscribeMyContacts(user.uid, setMyContacts);
     const unsubChats = subscribeChats(user.uid, setChats);
     const unsubCalls = subscribeCalls(user.uid, setCalls);
     const unsubPrivate = subscribeMyPrivateInfo(user.uid, setPrivateInfo);
 
     return () => {
+      unsubProfile();
       unsubContacts();
       unsubChats();
       unsubCalls();
       unsubPrivate();
     };
   }, [authReady, user]);
+
+  // Hydrate public profiles ONLY for peers in your active chats, calls, or saved contacts
+  useEffect(() => {
+    if (!user) return;
+    const neededUids = new Set<string>();
+    for (const c of chats) {
+      for (const id of c.memberIds) {
+        if (id !== user.uid) neededUids.add(id);
+      }
+    }
+    for (const c of myContacts) {
+      if (c.uid !== user.uid) neededUids.add(c.uid);
+    }
+    for (const call of calls) {
+      for (const id of call.participantIds) {
+        if (id !== user.uid) neededUids.add(id);
+      }
+    }
+
+    const missing = Array.from(neededUids).filter((uid) => !peerProfilesMap[uid]);
+    if (missing.length === 0) return;
+
+    let cancelled = false;
+    void Promise.all(missing.map((uid) => fetchUserProfileByUid(uid))).then((results) => {
+      if (cancelled) return;
+      const updates: Record<string, UserPublic> = {};
+      for (const p of results) {
+        if (p) updates[p.uid] = p;
+      }
+      if (Object.keys(updates).length > 0) {
+        setPeerProfilesMap((prev) => ({ ...prev, ...updates }));
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [calls, chats, myContacts, peerProfilesMap, user]);
+
+  const activeDirectPeerUid = useMemo(() => {
+    if (!user || !activeChatId) return null;
+    const currentChat = chats.find((c) => c.id === activeChatId);
+    if (!currentChat || currentChat.type !== 'direct') return null;
+    return currentChat.memberIds.find((id) => id !== user.uid) || null;
+  }, [activeChatId, chats, user]);
+
+  // Refresh direct peer's public E2EE keys when opening a chat
+  useEffect(() => {
+    if (!activeDirectPeerUid) return;
+    let cancelled = false;
+    void fetchUserProfileByUid(activeDirectPeerUid).then((freshPeer) => {
+      if (!cancelled && freshPeer) {
+        setPeerProfilesMap((prev) => ({ ...prev, [freshPeer.uid]: freshPeer }));
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeChatId, activeDirectPeerUid]);
 
   // Subscribe to messages for active chat
   useEffect(() => {
@@ -142,16 +216,16 @@ function MainApp() {
     return () => unsubMsgs();
   }, [activeChatId, authReady, user]);
 
-  const contactsMap = useMemo(() => {
-    const map: Record<string, UserPublic> = {};
-    for (const c of contacts) {
-      map[c.uid] = c;
+  const combinedProfilesMap = useMemo(() => {
+    const map: Record<string, UserPublic> = { ...peerProfilesMap };
+    if (myProfile) {
+      map[myProfile.uid] = myProfile;
     }
     return map;
-  }, [contacts]);
+  }, [myProfile, peerProfilesMap]);
 
-  const myProfile = user ? contactsMap[user.uid] || null : null;
-  const currentDisplayName = myProfile?.displayName || user?.displayName || user?.email?.split('@')[0] || 'User';
+  const currentDisplayName =
+    myProfile?.displayName || user?.displayName || user?.email?.split('@')[0] || 'User';
 
   const {
     onlineUids,
@@ -193,9 +267,19 @@ function MainApp() {
     await signOut(auth);
   };
 
-  const handleOpenDirectChat = async (peerUid: string) => {
+  const handleOpenDirectChat = async (peer: {
+    uid: string;
+    displayName: string;
+    photoURL: string;
+    bio: string;
+  }) => {
     if (!user) return;
-    const chatId = await getOrCreateDirectChat(user.uid, peerUid);
+    const fullPeer = peerProfilesMap[peer.uid] || (await fetchUserProfileByUid(peer.uid));
+    if (fullPeer) {
+      setPeerProfilesMap((prev) => ({ ...prev, [fullPeer.uid]: fullPeer }));
+      await saveUserContact(user.uid, fullPeer).catch(() => undefined);
+    }
+    const chatId = await getOrCreateDirectChat(user.uid, peer.uid);
     setActiveTab('chats');
     setActiveChatId(chatId);
   };
@@ -355,11 +439,12 @@ function MainApp() {
             language={language}
             currentUid={user.uid}
             chats={chats}
-            contactsMap={contactsMap}
+            contactsMap={combinedProfilesMap}
             onlineUids={onlineUids}
             typingByChat={typingByChat}
             activeChatId={activeChatId}
             onSelectChat={(id) => setActiveChatId(id)}
+            onStartDirectChatWithUser={(peer) => void handleOpenDirectChat(peer)}
             onOpenNewChat={() => setNewChatModal({ open: true, mode: 'direct' })}
           />
         )}
@@ -369,7 +454,7 @@ function MainApp() {
             language={language}
             currentUid={user.uid}
             calls={calls}
-            contactsMap={contactsMap}
+            contactsMap={combinedProfilesMap}
             onlineUids={onlineUids}
             onCallBack={(callType, peer) => void handleStartCallWithPeer(callType, peer)}
           />
@@ -379,9 +464,14 @@ function MainApp() {
           <ContactsPane
             language={language}
             currentUid={user.uid}
-            contacts={contacts}
+            myContacts={myContacts}
+            peerProfilesMap={peerProfilesMap}
             onlineUids={onlineUids}
-            onStartDirectChat={(uid) => void handleOpenDirectChat(uid)}
+            onStartDirectChat={(peer) => void handleOpenDirectChat(peer)}
+            onAddContactOnly={(peer) => {
+              setPeerProfilesMap((prev) => ({ ...prev, [peer.uid]: peer }));
+              void saveUserContact(user.uid, peer).catch(() => undefined);
+            }}
             onStartGroupModal={() => setNewChatModal({ open: true, mode: 'group' })}
             onCallContact={(callType, peer) =>
               void handleStartCallWithPeer(callType, {
@@ -421,10 +511,11 @@ function MainApp() {
           theme={theme}
           currentUid={user.uid}
           currentDisplayName={currentDisplayName}
+          myE2eeKeys={myE2eeKeys}
           getIdToken={() => user.getIdToken()}
           chat={activeChat}
           messages={messages}
-          contactsMap={contactsMap}
+          contactsMap={combinedProfilesMap}
           onlineUids={onlineUids}
           typingSenders={activeChatTypingSenders}
           onBack={() => setActiveChatId(null)}
@@ -439,7 +530,7 @@ function MainApp() {
         />
       </main>
 
-      {/* Mobile Fixed Bottom Navigation Bar (4 tabs, 64px height) */}
+      {/* Mobile Fixed Bottom Navigation Bar */}
       {!isMobileThreadOpen && (
         <nav
           aria-label="Mobile navigation"
@@ -475,10 +566,10 @@ function MainApp() {
         isOpen={newChatModal.open}
         initialMode={newChatModal.mode}
         currentUid={user.uid}
-        contacts={contacts}
+        myContacts={myContacts}
         onlineUids={onlineUids}
         onClose={() => setNewChatModal((prev) => ({ ...prev, open: false }))}
-        onCreateDirect={(peerUid) => void handleOpenDirectChat(peerUid)}
+        onCreateDirect={(peer) => void handleOpenDirectChat(peer)}
         onCreateGroup={(name, memberUids) => void handleCreateGroup(name, memberUids)}
       />
 

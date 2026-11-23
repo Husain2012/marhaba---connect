@@ -1,7 +1,8 @@
-import { Check, Users, X } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { Check, Search, Users, X } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
 import { getCopy } from '../i18n/translations';
-import { Language, UserPublic } from '../types/chat';
+import { searchDiscoverableUsers } from '../lib/chatService';
+import { Language, UserContact, UserPublic } from '../types/chat';
 import { Avatar } from './Avatar';
 
 interface NewChatModalProps {
@@ -9,10 +10,10 @@ interface NewChatModalProps {
   isOpen: boolean;
   initialMode: 'direct' | 'group';
   currentUid: string;
-  contacts: UserPublic[];
+  myContacts: UserContact[];
   onlineUids: string[];
   onClose: () => void;
-  onCreateDirect: (peerUid: string) => void;
+  onCreateDirect: (peer: { uid: string; displayName: string; photoURL: string; bio: string }) => void;
   onCreateGroup: (name: string, memberUids: string[]) => void;
 }
 
@@ -21,7 +22,7 @@ export function NewChatModal({
   isOpen,
   initialMode,
   currentUid,
-  contacts,
+  myContacts,
   onlineUids,
   onClose,
   onCreateDirect,
@@ -31,16 +32,65 @@ export function NewChatModal({
   const [mode, setMode] = useState<'direct' | 'group'>(initialMode);
   const [groupName, setGroupName] = useState('');
   const [selectedUids, setSelectedUids] = useState<string[]>([]);
+  const [search, setSearch] = useState('');
+  const [searchResults, setSearchResults] = useState<UserPublic[]>([]);
+  const [searching, setSearching] = useState(false);
 
   useEffect(() => {
     if (isOpen) {
       setMode(initialMode);
+      setSearch('');
+      setSearchResults([]);
     }
   }, [initialMode, isOpen]);
 
-  if (!isOpen) return null;
+  useEffect(() => {
+    const q = search.trim();
+    if (!isOpen || q.length < 2) {
+      setSearchResults([]);
+      setSearching(false);
+      return;
+    }
 
-  const available = contacts.filter((c) => c.uid !== currentUid);
+    let cancelled = false;
+    setSearching(true);
+    const timer = window.setTimeout(async () => {
+      try {
+        const found = await searchDiscoverableUsers(q, currentUid);
+        if (!cancelled) {
+          setSearchResults(found);
+        }
+      } finally {
+        if (!cancelled) {
+          setSearching(false);
+        }
+      }
+    }, 260);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [currentUid, isOpen, search]);
+
+  const combinedList = useMemo(() => {
+    const map = new Map<string, { uid: string; displayName: string; photoURL: string; bio: string; connectCode?: string }>();
+    const q = search.trim().toLowerCase();
+    for (const c of myContacts) {
+      if (c.uid === currentUid) continue;
+      if (!q || c.displayName.toLowerCase().includes(q) || c.bio.toLowerCase().includes(q)) {
+        map.set(c.uid, c);
+      }
+    }
+    for (const u of searchResults) {
+      if (u.uid !== currentUid) {
+        map.set(u.uid, u);
+      }
+    }
+    return Array.from(map.values());
+  }, [currentUid, myContacts, search, searchResults]);
+
+  if (!isOpen) return null;
 
   const toggleMember = (uid: string) => {
     setSelectedUids((prev) =>
@@ -109,15 +159,30 @@ export function NewChatModal({
               className="w-full min-h-[44px] px-3.5 py-2 rounded-xl bg-slate-100 dark:bg-[#192330] text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#007AFF]/40"
             />
           )}
+
+          <div className="relative">
+            <Search className="w-4 h-4 text-slate-400 absolute start-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <input
+              type="search"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder={t.searchContacts}
+              className="w-full min-h-[44px] ps-10 pe-4 py-2 rounded-xl bg-slate-100 dark:bg-[#192330] text-sm text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-[#007AFF]/40"
+            />
+          </div>
         </div>
 
         <div className="flex-1 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800/70">
-          {available.length === 0 ? (
-            <div className="p-8 text-center text-sm text-slate-500 dark:text-slate-400">
-              {t.noContacts}
+          {searching ? (
+            <div className="p-6 text-center text-xs text-slate-500 dark:text-slate-400">
+              {t.searching}
+            </div>
+          ) : combinedList.length === 0 ? (
+            <div className="p-8 text-center text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
+              {search.trim().length >= 2 ? t.noSearchResults : t.searchHint}
             </div>
           ) : (
-            available.map((contact) => {
+            combinedList.map((contact) => {
               const selected = selectedUids.includes(contact.uid);
               return (
                 <button
@@ -125,7 +190,7 @@ export function NewChatModal({
                   type="button"
                   onClick={() => {
                     if (mode === 'direct') {
-                      onCreateDirect(contact.uid);
+                      onCreateDirect(contact);
                       onClose();
                     } else {
                       toggleMember(contact.uid);
@@ -145,6 +210,7 @@ export function NewChatModal({
                         {contact.displayName}
                       </div>
                       <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
+                        {contact.connectCode ? `${contact.connectCode} · ` : ''}
                         {contact.bio}
                       </div>
                     </div>

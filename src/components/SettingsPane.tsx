@@ -1,4 +1,4 @@
-import { Check, Globe, LogOut, Moon, Smartphone, Sun } from 'lucide-react';
+import { Check, Copy, Globe, LogOut, Moon, Smartphone, Sun } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { getCopy } from '../i18n/translations';
 import { updateUserPrivatePhone, updateUserProfile } from '../lib/chatService';
@@ -33,6 +33,7 @@ export function SettingsPane({
   const [discoverable, setDiscoverable] = useState(profile?.isDiscoverable ?? true);
   const [saving, setSaving] = useState(false);
   const [savedFlag, setSavedFlag] = useState(false);
+  const [copiedCode, setCopiedCode] = useState(false);
 
   useEffect(() => {
     if (profile) {
@@ -67,6 +68,13 @@ export function SettingsPane({
     }
   };
 
+  const handleCopyConnectCode = () => {
+    if (!profile?.connectCode) return;
+    void navigator.clipboard.writeText(profile.connectCode);
+    setCopiedCode(true);
+    window.setTimeout(() => setCopiedCode(false), 2000);
+  };
+
   return (
     <div className="flex flex-col h-full bg-white dark:bg-[#111822]">
       <div className="px-4 py-4 border-b border-slate-200/80 dark:border-slate-800">
@@ -85,13 +93,34 @@ export function SettingsPane({
               isOnline={true}
               size="lg"
             />
-            <div className="min-w-0">
+            <div className="min-w-0 flex-1">
               <div className="font-display font-bold text-base text-slate-900 dark:text-white truncate">
                 {profile?.displayName || email}
               </div>
               <div className="text-xs text-slate-500 dark:text-slate-400 truncate">{email}</div>
             </div>
           </div>
+
+          {profile?.connectCode && (
+            <div className="p-3 rounded-xl bg-slate-100 dark:bg-[#192330] flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                  {t.settings.connectId}
+                </div>
+                <div className="font-mono text-sm font-bold text-slate-900 dark:text-white">
+                  {profile.connectCode}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleCopyConnectCode}
+                className="min-h-[38px] px-3 rounded-lg bg-white dark:bg-[#223042] text-xs font-semibold text-[#007AFF] flex items-center gap-1.5 shadow-xs shrink-0"
+              >
+                {copiedCode ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                <span>{copiedCode ? t.settings.copied : t.settings.copyCode}</span>
+              </button>
+            </div>
+          )}
 
           <div className="space-y-3">
             <label className="block space-y-1">

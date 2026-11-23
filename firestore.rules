@@ -39,17 +39,22 @@ service cloud.firestore {
 
     function isValidUserPublic(data, userId) {
       return data.keys().hasAll([
-          'uid', 'displayName', 'photoURL', 'bio', 'isOnline',
-          'isDiscoverable', 'language', 'lastSeen', 'createdAt', 'updatedAt'
+          'uid', 'displayName', 'photoURL', 'bio', 'connectCode',
+          'e2eeKeyX', 'e2eeKeyY', 'isOnline', 'isDiscoverable',
+          'language', 'lastSeen', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'uid', 'displayName', 'photoURL', 'bio', 'isOnline',
-          'isDiscoverable', 'language', 'lastSeen', 'createdAt', 'updatedAt'
+          'uid', 'displayName', 'photoURL', 'bio', 'connectCode',
+          'e2eeKeyX', 'e2eeKeyY', 'isOnline', 'isDiscoverable',
+          'language', 'lastSeen', 'createdAt', 'updatedAt'
         ])
         && data.uid is string && data.uid == userId && isValidId(data.uid)
         && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80
         && data.photoURL is string && data.photoURL.size() <= 512
         && data.bio is string && data.bio.size() <= 160
+        && data.connectCode is string && data.connectCode.size() >= 4 && data.connectCode.size() <= 24
+        && data.e2eeKeyX is string && data.e2eeKeyX.size() <= 128
+        && data.e2eeKeyY is string && data.e2eeKeyY.size() <= 128
         && data.isOnline is bool
         && data.isDiscoverable is bool
         && data.language in ['ar', 'en']
@@ -64,6 +69,17 @@ service cloud.firestore {
         && data.uid is string && data.uid == userId && isValidId(data.uid)
         && data.email is string && data.email.size() <= 254
         && data.phone is string && data.phone.size() <= 32
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserContact(data, contactUid) {
+      return data.keys().hasAll(['uid', 'displayName', 'photoURL', 'bio', 'addedAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'photoURL', 'bio', 'addedAt', 'updatedAt'])
+        && data.uid is string && data.uid == contactUid && isValidId(data.uid)
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80
+        && data.photoURL is string && data.photoURL.size() <= 512
+        && data.bio is string && data.bio.size() <= 160
+        && data.addedAt is timestamp
         && data.updatedAt is timestamp;
     }
 
@@ -105,13 +121,17 @@ service cloud.firestore {
     function isValidMessage(data, chatId, messageId) {
       return data.keys().hasAll([
           'id', 'chatId', 'senderId', 'senderName', 'memberIds', 'type',
-          'text', 'mediaUrl', 'fileName', 'fileSize', 'mimeType',
+          'text', 'isEncrypted', 'ciphertext', 'iv',
+          'senderKeyX', 'senderKeyY', 'recipientKeyX', 'recipientKeyY',
+          'mediaUrl', 'fileName', 'fileSize', 'mimeType',
           'audioDurationSec', 'replyToId', 'replyToPreview', 'readBy',
           'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
           'id', 'chatId', 'senderId', 'senderName', 'memberIds', 'type',
-          'text', 'mediaUrl', 'fileName', 'fileSize', 'mimeType',
+          'text', 'isEncrypted', 'ciphertext', 'iv',
+          'senderKeyX', 'senderKeyY', 'recipientKeyX', 'recipientKeyY',
+          'mediaUrl', 'fileName', 'fileSize', 'mimeType',
           'audioDurationSec', 'replyToId', 'replyToPreview', 'readBy',
           'createdAt', 'updatedAt'
         ])
@@ -123,6 +143,13 @@ service cloud.firestore {
         && data.memberIds[0] is string
         && data.type in ['text', 'image', 'file', 'audio', 'call']
         && data.text is string && data.text.size() <= 4000
+        && data.isEncrypted is bool
+        && data.ciphertext is string && data.ciphertext.size() <= 8000
+        && data.iv is string && data.iv.size() <= 64
+        && data.senderKeyX is string && data.senderKeyX.size() <= 128
+        && data.senderKeyY is string && data.senderKeyY.size() <= 128
+        && data.recipientKeyX is string && data.recipientKeyX.size() <= 128
+        && data.recipientKeyY is string && data.recipientKeyY.size() <= 128
         && data.mediaUrl is string && data.mediaUrl.size() <= 512
         && data.fileName is string && data.fileName.size() <= 180
         && data.fileSize is number && data.fileSize >= 0 && data.fileSize <= 26214400
@@ -182,7 +209,8 @@ service cloud.firestore {
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && incoming().diff(existing()).affectedKeys().hasOnly([
-          'displayName', 'photoURL', 'bio', 'isOnline', 'isDiscoverable',
+          'displayName', 'photoURL', 'bio', 'connectCode',
+          'e2eeKeyX', 'e2eeKeyY', 'isOnline', 'isDiscoverable',
           'language', 'lastSeen', 'updatedAt'
         ]);
       allow delete: if false;
@@ -208,6 +236,29 @@ service cloud.firestore {
           && incoming().updatedAt == request.time
           && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'phone', 'updatedAt']);
         allow delete: if false;
+      }
+
+      // Private per-user saved contacts subcollection
+      match /contacts/{contactUid} {
+        allow get: if isSignedIn() && isValidId(userId) && isValidId(contactUid) && isOwner(userId);
+        allow list: if isSignedIn() && isOwner(userId);
+        allow create: if isVerifiedUser()
+          && isValidId(userId)
+          && isValidId(contactUid)
+          && isOwner(userId)
+          && isValidUserContact(incoming(), contactUid)
+          && incoming().addedAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isVerifiedUser()
+          && isValidId(userId)
+          && isValidId(contactUid)
+          && isOwner(userId)
+          && isValidUserContact(incoming(), contactUid)
+          && incoming().uid == existing().uid
+          && incoming().addedAt == existing().addedAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'bio', 'updatedAt']);
+        allow delete: if isVerifiedUser() && isValidId(userId) && isValidId(contactUid) && isOwner(userId);
       }
     }
 
