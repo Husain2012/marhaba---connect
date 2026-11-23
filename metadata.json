@@ -1,0 +1,6 @@
+{
+  "name": "Marhaba Connect",
+  "description": "Bilingual Arabic (RTL) and English (LTR) instant messaging, voice notes, file sharing, and WebRTC audio/video calling app ready for Android.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

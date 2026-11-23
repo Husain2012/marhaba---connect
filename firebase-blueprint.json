@@ -1,0 +1,391 @@
+{
+  "entities": {
+    "UserPublic": {
+      "title": "UserPublic",
+      "description": "Public discoverable profile for messaging contacts without PII.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "photoURL": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "bio": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "isOnline": {
+          "type": "boolean"
+        },
+        "isDiscoverable": {
+          "type": "boolean"
+        },
+        "language": {
+          "type": "string",
+          "enum": ["ar", "en"]
+        },
+        "lastSeen": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "uid",
+        "displayName",
+        "photoURL",
+        "bio",
+        "isOnline",
+        "isDiscoverable",
+        "language",
+        "lastSeen",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "UserPrivate": {
+      "title": "UserPrivate",
+      "description": "Isolated PII document for the authenticated user only.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 254
+        },
+        "phone": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "phone", "updatedAt"]
+    },
+    "Chat": {
+      "title": "Chat",
+      "description": "Direct or group conversation room metadata.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["direct", "group"]
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "memberIds": {
+          "type": "array",
+          "description": "Bounded list of up to 50 participant UIDs."
+        },
+        "lastMessageText": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "lastMessageType": {
+          "type": "string",
+          "enum": ["text", "image", "file", "audio", "call"]
+        },
+        "lastMessageSenderId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "lastMessageAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "name",
+        "createdBy",
+        "memberIds",
+        "lastMessageText",
+        "lastMessageType",
+        "lastMessageSenderId",
+        "lastMessageAt",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ChatMember": {
+      "title": "ChatMember",
+      "description": "Membership role and notification preference per chat participant.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["owner", "member"]
+        },
+        "muted": {
+          "type": "boolean"
+        },
+        "joinedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "role", "muted", "joinedAt", "updatedAt"]
+    },
+    "Message": {
+      "title": "Message",
+      "description": "Instant message inside a chat (text, voice note, image, file, or call log).",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "chatId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "senderId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "senderName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "memberIds": {
+          "type": "array",
+          "description": "Denormalized participant UIDs matching parent chat."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["text", "image", "file", "audio", "call"]
+        },
+        "text": {
+          "type": "string",
+          "maxLength": 4000
+        },
+        "mediaUrl": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "fileName": {
+          "type": "string",
+          "maxLength": 180
+        },
+        "fileSize": {
+          "type": "number"
+        },
+        "mimeType": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "audioDurationSec": {
+          "type": "number"
+        },
+        "replyToId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "replyToPreview": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "readBy": {
+          "type": "array",
+          "description": "Bounded list of UIDs who read the message."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "chatId",
+        "senderId",
+        "senderName",
+        "memberIds",
+        "type",
+        "text",
+        "mediaUrl",
+        "fileName",
+        "fileSize",
+        "mimeType",
+        "audioDurationSec",
+        "replyToId",
+        "replyToPreview",
+        "readBy",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "CallRecord": {
+      "title": "CallRecord",
+      "description": "Audio or video call session record between participants.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "chatId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "callerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "callerName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "calleeId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "calleeName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "participantIds": {
+          "type": "array",
+          "description": "Strictly 2 UIDs: callerId and calleeId."
+        },
+        "callType": {
+          "type": "string",
+          "enum": ["audio", "video"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["ringing", "active", "ended", "missed", "declined"]
+        },
+        "durationSec": {
+          "type": "number"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "chatId",
+        "callerId",
+        "callerName",
+        "calleeId",
+        "calleeName",
+        "participantIds",
+        "callType",
+        "status",
+        "durationSec",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserPublic" },
+      "description": "Public contact directory profile without PII."
+    },
+    "/users/{userId}/private/{docId}": {
+      "schema": { "$ref": "#/entities/UserPrivate" },
+      "description": "Isolated PII document accessible only to the owning user."
+    },
+    "/chats/{chatId}": {
+      "schema": { "$ref": "#/entities/Chat" },
+      "description": "Direct and group chat rooms."
+    },
+    "/chats/{chatId}/members/{memberUid}": {
+      "schema": { "$ref": "#/entities/ChatMember" },
+      "description": "Chat participant membership documents."
+    },
+    "/chats/{chatId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/Message" },
+      "description": "Messages belonging to a chat."
+    },
+    "/calls/{callId}": {
+      "schema": { "$ref": "#/entities/CallRecord" },
+      "description": "Voice and video call logs."
+    }
+  }
+}
