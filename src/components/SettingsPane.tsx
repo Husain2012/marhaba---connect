@@ -4,6 +4,7 @@ import { getCopy } from '../i18n/translations';
 import { updateUserPrivatePhone, updateUserProfile } from '../lib/chatService';
 import { Language, ThemeMode, UserPrivate, UserPublic } from '../types/chat';
 import { Avatar } from './Avatar';
+import { PWAInstallButton } from './PWAInstallButton';
 
 interface SettingsPaneProps {
   language: Language;
@@ -273,6 +274,7 @@ export function SettingsPane({
           <div className="text-[11px] font-mono text-slate-500 dark:text-slate-400 pt-1">
             {t.settings.packageId}: com.marhabaconnect.app
           </div>
+          <PWAInstallButton language={language} />
         </section>
 
         <button
