@@ -9,7 +9,7 @@ import { WebSocket, WebSocketServer } from 'ws';
 
 dotenv.config();
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const app = express();
 const uploadsDir = path.resolve(process.cwd(), '.data', 'uploads');
 fs.mkdirSync(uploadsDir, { recursive: true });
