@@ -203,8 +203,8 @@ app.get('/api/files/:fileId', (req, res) => {
 
 const server = http.createServer(app);
 
-// WebSocket signaling & presence hub
-const wss = new WebSocketServer({ server, path: '/ws' });
+// WebSocket signaling & presence hub (disable perMessageDeflate for minimal latency on live audio/video)
+const wss = new WebSocketServer({ server, path: '/ws', perMessageDeflate: false });
 const socketsByUid = new Map<string, Set<WebSocket>>();
 const uidBySocket = new Map<WebSocket, string>();
 
@@ -224,16 +224,24 @@ function broadcastPresence() {
   }
 }
 
-function sendToUser(targetUid: string, payload: unknown, excludeWs?: WebSocket) {
+function sendToUser(targetUid: string, payload: unknown, excludeWs?: WebSocket, maxBufferedBytes?: number) {
   const userSockets = socketsByUid.get(targetUid);
   if (!userSockets) return;
+  const serialized = JSON.stringify(payload);
   for (const sock of userSockets) {
     if (excludeWs && sock === excludeWs) continue;
-    sendJson(sock, payload);
+    if (sock.readyState !== WebSocket.OPEN) continue;
+    if (maxBufferedBytes !== undefined && sock.bufferedAmount > maxBufferedBytes) {
+      continue;
+    }
+    sock.send(serialized);
   }
 }
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  // Flush small audio packets immediately without Nagle 40-200ms buffering
+  req.socket?.setNoDelay?.(true);
+
   ws.on('message', async (raw) => {
     let msg: Record<string, unknown>;
     try {
@@ -310,7 +318,7 @@ wss.on('connection', (ws) => {
       const callId = typeof msg.callId === 'string' ? msg.callId : '';
       const pcm = typeof msg.pcm === 'string' ? msg.pcm : '';
       const sr = typeof msg.sr === 'number' ? msg.sr : 16000;
-      if (!toUid || !callId || !pcm || pcm.length > 32768) return;
+      if (!toUid || !callId || !pcm || pcm.length > 65536) return;
       sendToUser(
         toUid,
         {
@@ -332,6 +340,7 @@ wss.on('connection', (ws) => {
       if (!toUid || !callId || !frame || frame.length > 220000 || !frame.startsWith('data:image/jpeg;base64,')) {
         return;
       }
+      // Drop video frames if recipient socket is backed up so audio packets stay real-time
       sendToUser(
         toUid,
         {
@@ -340,7 +349,8 @@ wss.on('connection', (ws) => {
           fromUid: senderUid,
           frame,
         },
-        ws
+        ws,
+        96 * 1024
       );
     }
   });

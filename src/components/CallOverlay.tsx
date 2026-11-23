@@ -47,16 +47,25 @@ export function CallOverlay({
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
   const [elapsedSec, setElapsedSec] = useState(0);
   const [audioBlocked, setAudioBlocked] = useState(false);
+  const [webrtcVideoReady, setWebrtcVideoReady] = useState(false);
 
   const isVideo = call?.callType === 'video';
-  const hasRemoteVideo = Boolean(
-    isVideo && remoteStream && remoteStream.getVideoTracks().length > 0
+  const hasRemoteTrack = Boolean(
+    isVideo && callTransport !== 'relay' && remoteStream && remoteStream.getVideoTracks().length > 0
   );
-  const hasRelayVideo = Boolean(isVideo && !hasRemoteVideo && relayVideoFrame);
+  const hasRelayVideo = Boolean(isVideo && relayVideoFrame && (callTransport === 'relay' || !webrtcVideoReady));
+  const hasRemoteVideo = Boolean(hasRemoteTrack && !hasRelayVideo);
   const hasAnyRemoteVideo = hasRemoteVideo || hasRelayVideo;
   const hasLocalVideo = Boolean(
     isVideo && localStream && localStream.getVideoTracks().length > 0
   );
+
+  // Reset WebRTC video readiness when stream changes or relay takes over
+  useEffect(() => {
+    if (!remoteStream || callTransport === 'relay') {
+      setWebrtcVideoReady(false);
+    }
+  }, [remoteStream, callTransport]);
 
   // Attach & play local camera stream
   useEffect(() => {
@@ -67,10 +76,12 @@ export function CallOverlay({
     void videoEl.play().catch(() => undefined);
   }, [localStream, hasLocalVideo, call?.status]);
 
-  // Attach & play WebRTC remote stream when available
+  // Attach & play WebRTC remote stream ONLY when not in relay mode
   useEffect(() => {
-    if (!remoteStream) {
+    if (!remoteStream || callTransport === 'relay') {
       setAudioBlocked(false);
+      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+      if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
       return;
     }
 
@@ -92,7 +103,7 @@ export function CallOverlay({
     } else if (!hasRelayVideo) {
       void playMedia(remoteAudioRef.current);
     }
-  }, [remoteStream, hasRemoteVideo, hasRelayVideo, call?.status]);
+  }, [remoteStream, callTransport, hasRemoteVideo, hasRelayVideo, call?.status]);
 
   useEffect(() => {
     if (!call || call.status !== 'active' || !call.startedAtMs) {
@@ -109,6 +120,10 @@ export function CallOverlay({
 
   const handleUnlockAudio = () => {
     onUnlockAudio();
+    if (callTransport === 'relay') {
+      setAudioBlocked(false);
+      return;
+    }
     const target = hasRemoteVideo ? remoteVideoRef.current : remoteAudioRef.current;
     if (!target) {
       setAudioBlocked(false);
@@ -138,13 +153,25 @@ export function CallOverlay({
       onClick={() => onUnlockAudio()}
       className="fixed inset-0 z-50 bg-slate-950 text-white flex flex-col justify-between overflow-hidden"
     >
-      {!hasRemoteVideo && <audio ref={remoteAudioRef} autoPlay playsInline />}
+      {callTransport !== 'relay' && !hasRemoteVideo && (
+        <audio ref={remoteAudioRef} autoPlay playsInline />
+      )}
 
       {hasRemoteVideo ? (
         <video
           ref={remoteVideoRef}
           autoPlay
           playsInline
+          onLoadedData={() => {
+            if (remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0) {
+              setWebrtcVideoReady(true);
+            }
+          }}
+          onPlaying={() => {
+            if (remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0) {
+              setWebrtcVideoReady(true);
+            }
+          }}
           onLoadedMetadata={() => {
             void remoteVideoRef.current?.play().catch(() => undefined);
           }}
