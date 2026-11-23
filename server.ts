@@ -75,6 +75,42 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', service: 'marhaba-connect' });
 });
 
+// Authenticated WebRTC ICE server configuration (STUN + optional TURN env vars)
+app.get('/api/ice-servers', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  const verified = await verifyFirebaseIdToken(token);
+  if (!verified) {
+    res.status(401).json({ error: 'Authentication required' });
+    return;
+  }
+
+  const iceServers: Array<{ urls: string | string[]; username?: string; credential?: string }> = [
+    {
+      urls: [
+        'stun:stun.l.google.com:19302',
+        'stun:stun1.l.google.com:19302',
+        'stun:stun2.l.google.com:19302',
+        'stun:stun.cloudflare.com:3478',
+      ],
+    },
+  ];
+
+  const turnUrls = (process.env.TURN_URLS || '')
+    .split(',')
+    .map((u) => u.trim())
+    .filter(Boolean);
+  if (turnUrls.length > 0 && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) {
+    iceServers.push({
+      urls: turnUrls,
+      username: process.env.TURN_USERNAME,
+      credential: process.env.TURN_CREDENTIAL,
+    });
+  }
+
+  res.json({ iceServers });
+});
+
 // Authenticated file/media upload endpoint
 app.post('/api/upload', async (req, res) => {
   const authHeader = req.headers.authorization;
@@ -206,6 +242,11 @@ wss.on('connection', (ws) => {
     }
 
     const type = msg.type;
+    if (type === 'ping') {
+      sendJson(ws, { type: 'pong' });
+      return;
+    }
+
     if (type === 'auth') {
       const token = typeof msg.token === 'string' ? msg.token : '';
       const verified = await verifyFirebaseIdToken(token);

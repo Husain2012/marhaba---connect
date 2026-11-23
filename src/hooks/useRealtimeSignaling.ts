@@ -3,12 +3,16 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { createCallRecord, generateId, sendChatMessage, updateCallStatus } from '../lib/chatService';
 import { ActiveCallSession, CallType } from '../types/chat';
 
-const ICE_SERVERS: RTCConfiguration = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-  ],
-};
+const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
+  {
+    urls: [
+      'stun:stun.l.google.com:19302',
+      'stun:stun1.l.google.com:19302',
+      'stun:stun2.l.google.com:19302',
+      'stun:stun.cloudflare.com:3478',
+    ],
+  },
+];
 
 interface UseRealtimeSignalingOptions {
   user: User | null;
@@ -34,11 +38,14 @@ export function useRealtimeSignaling({
   const wsRef = useRef<WebSocket | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
+  const remoteStreamRef = useRef<MediaStream | null>(null);
   const activeCallRef = useRef<ActiveCallSession | null>(null);
   const pendingOfferRef = useRef<{ callId: string; sdp: RTCSessionDescriptionInit } | null>(null);
-  const pendingIceRef = useRef<RTCIceCandidateInit[]>([]);
+  const pendingIceMapRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
   const ringtoneTimerRef = useRef<number | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const iceFailTimerRef = useRef<number | null>(null);
+  const iceRestartedRef = useRef<boolean>(false);
 
   useEffect(() => {
     activeCallRef.current = activeCall;
@@ -55,42 +62,54 @@ export function useRealtimeSignaling({
     }
   }, []);
 
-  const startRingtone = useCallback((mode: 'incoming' | 'outgoing') => {
-    stopRingtone();
-    try {
-      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      if (!AudioCtx) return;
-      const ctx = new AudioCtx();
-      audioCtxRef.current = ctx;
+  const startRingtone = useCallback(
+    (mode: 'incoming' | 'outgoing') => {
+      stopRingtone();
+      try {
+        const AudioCtx =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        if (!AudioCtx) return;
+        const ctx = new AudioCtx();
+        audioCtxRef.current = ctx;
 
-      const playTone = () => {
-        if (ctx.state === 'closed') return;
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = 'sine';
-        osc.frequency.value = mode === 'incoming' ? 520 : 440;
-        gain.gain.setValueAtTime(0.001, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.07, ctx.currentTime + 0.05);
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.45);
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.start();
-        osc.stop(ctx.currentTime + 0.48);
-      };
+        const playTone = () => {
+          if (ctx.state === 'closed') return;
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.type = 'sine';
+          osc.frequency.value = mode === 'incoming' ? 520 : 440;
+          gain.gain.setValueAtTime(0.001, ctx.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.07, ctx.currentTime + 0.05);
+          gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.45);
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start();
+          osc.stop(ctx.currentTime + 0.48);
+        };
 
-      playTone();
-      ringtoneTimerRef.current = window.setInterval(playTone, mode === 'incoming' ? 1600 : 2200);
-    } catch {
-      // Ignore Web Audio autoplay restrictions
-    }
-  }, [stopRingtone]);
+        playTone();
+        ringtoneTimerRef.current = window.setInterval(playTone, mode === 'incoming' ? 1600 : 2200);
+      } catch {
+        // Ignore Web Audio autoplay restrictions
+      }
+    },
+    [stopRingtone]
+  );
 
   const cleanupCallMedia = useCallback(() => {
     stopRingtone();
+    if (iceFailTimerRef.current !== null) {
+      window.clearTimeout(iceFailTimerRef.current);
+      iceFailTimerRef.current = null;
+    }
+    iceRestartedRef.current = false;
+
     if (pcRef.current) {
       pcRef.current.onicecandidate = null;
       pcRef.current.ontrack = null;
       pcRef.current.onconnectionstatechange = null;
+      pcRef.current.oniceconnectionstatechange = null;
       pcRef.current.close();
       pcRef.current = null;
     }
@@ -98,8 +117,9 @@ export function useRealtimeSignaling({
       localStreamRef.current.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
     }
+    remoteStreamRef.current = null;
     pendingOfferRef.current = null;
-    pendingIceRef.current = [];
+    pendingIceMapRef.current.clear();
     setLocalStream(null);
     setRemoteStream(null);
     setIsMuted(false);
@@ -113,16 +133,67 @@ export function useRealtimeSignaling({
     }
   }, []);
 
+  const fetchIceConfiguration = useCallback(async (): Promise<RTCConfiguration> => {
+    if (!user) {
+      return { iceServers: DEFAULT_ICE_SERVERS, iceCandidatePoolSize: 10 };
+    }
+    try {
+      const token = await user.getIdToken();
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), 1800);
+      const resp = await fetch('/api/ice-servers', {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: controller.signal,
+      });
+      window.clearTimeout(timer);
+      if (resp.ok) {
+        const data = (await resp.json()) as { iceServers?: RTCIceServer[] };
+        if (Array.isArray(data.iceServers) && data.iceServers.length > 0) {
+          return { iceServers: data.iceServers, iceCandidatePoolSize: 10 };
+        }
+      }
+    } catch {
+      // Fallback cleanly to default STUN servers
+    }
+    return { iceServers: DEFAULT_ICE_SERVERS, iceCandidatePoolSize: 10 };
+  }, [user]);
+
+  const drainPendingIce = useCallback(async (callId: string, pc: RTCPeerConnection) => {
+    const queue = pendingIceMapRef.current.get(callId);
+    if (!queue || queue.length === 0) return;
+    pendingIceMapRef.current.delete(callId);
+    for (const cand of queue) {
+      await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => undefined);
+    }
+  }, []);
+
   const createPeerConnection = useCallback(
-    (callId: string, peerUid: string) => {
-      const pc = new RTCPeerConnection(ICE_SERVERS);
+    (callId: string, peerUid: string, rtcConfig: RTCConfiguration) => {
+      const pc = new RTCPeerConnection(rtcConfig);
       const remote = new MediaStream();
-      setRemoteStream(remote);
+      remoteStreamRef.current = remote;
+      iceRestartedRef.current = false;
+
+      const emitRemoteStream = () => {
+        const tracks = remote.getTracks();
+        if (tracks.length > 0) {
+          setRemoteStream(new MediaStream(tracks));
+        }
+      };
 
       pc.ontrack = (event) => {
-        event.streams[0]?.getTracks().forEach((track) => {
-          remote.addTrack(track);
-        });
+        const incomingTracks =
+          event.streams[0] && event.streams[0].getTracks().length > 0
+            ? event.streams[0].getTracks()
+            : [event.track];
+
+        for (const track of incomingTracks) {
+          if (!remote.getTracks().some((t) => t.id === track.id)) {
+            remote.addTrack(track);
+            track.onunmute = () => emitRemoteStream();
+          }
+        }
+        emitRemoteStream();
       };
 
       pc.onicecandidate = (event) => {
@@ -136,26 +207,62 @@ export function useRealtimeSignaling({
         }
       };
 
+      const markConnected = () => {
+        if (iceFailTimerRef.current !== null) {
+          window.clearTimeout(iceFailTimerRef.current);
+          iceFailTimerRef.current = null;
+        }
+        stopRingtone();
+        setActiveCall((prev) => {
+          if (!prev || prev.callId !== callId) return prev;
+          if (prev.status === 'active' && prev.startedAtMs) return prev;
+          return {
+            ...prev,
+            status: 'active',
+            startedAtMs: prev.startedAtMs || Date.now(),
+          };
+        });
+        void updateCallStatus(callId, 'active', 0);
+      };
+
+      const handlePossibleFailure = (state: string) => {
+        if (state === 'failed') {
+          if (!iceRestartedRef.current && typeof pc.restartIce === 'function') {
+            iceRestartedRef.current = true;
+            pc.restartIce();
+          }
+          if (iceFailTimerRef.current === null) {
+            iceFailTimerRef.current = window.setTimeout(() => {
+              const cur = activeCallRef.current;
+              if (
+                cur &&
+                cur.callId === callId &&
+                (pc.connectionState === 'failed' || pc.iceConnectionState === 'failed')
+              ) {
+                const elapsed = cur.startedAtMs
+                  ? Math.round((Date.now() - cur.startedAtMs) / 1000)
+                  : 0;
+                void updateCallStatus(callId, 'ended', elapsed);
+                cleanupCallMedia();
+              }
+            }, 6000);
+          }
+        }
+      };
+
       pc.onconnectionstatechange = () => {
         if (pc.connectionState === 'connected') {
-          stopRingtone();
-          setActiveCall((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  status: 'active',
-                  startedAtMs: prev.startedAtMs || Date.now(),
-                }
-              : null
-          );
-          void updateCallStatus(callId, 'active', 0);
-        } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-          const cur = activeCallRef.current;
-          if (cur && cur.callId === callId) {
-            const elapsed = cur.startedAtMs ? Math.round((Date.now() - cur.startedAtMs) / 1000) : 0;
-            void updateCallStatus(callId, 'ended', elapsed);
-            cleanupCallMedia();
-          }
+          markConnected();
+        } else if (pc.connectionState === 'failed') {
+          handlePossibleFailure('failed');
+        }
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+          markConnected();
+        } else if (pc.iceConnectionState === 'failed') {
+          handlePossibleFailure('failed');
         }
       };
 
@@ -165,7 +272,7 @@ export function useRealtimeSignaling({
     [cleanupCallMedia, sendWs, stopRingtone]
   );
 
-  // Connect & maintain WebSocket signaling
+  // Connect & maintain WebSocket signaling with keepalive ping
   useEffect(() => {
     if (!user) {
       cleanupCallMedia();
@@ -175,6 +282,7 @@ export function useRealtimeSignaling({
 
     let cancelled = false;
     let reconnectTimeout: number | null = null;
+    let pingInterval: number | null = null;
 
     const connect = async () => {
       if (cancelled) return;
@@ -188,6 +296,12 @@ export function useRealtimeSignaling({
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'auth', token }));
           }
+          if (pingInterval !== null) window.clearInterval(pingInterval);
+          pingInterval = window.setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'ping' }));
+            }
+          }, 25000);
         } catch {
           ws.close();
         }
@@ -202,6 +316,8 @@ export function useRealtimeSignaling({
         }
 
         const type = msg.type;
+        if (type === 'pong') return;
+
         if (type === 'presence:list' && Array.isArray(msg.onlineUids)) {
           setOnlineUids(msg.onlineUids.map(String));
           return;
@@ -238,7 +354,9 @@ export function useRealtimeSignaling({
           }
 
           pendingOfferRef.current = { callId, sdp };
-          pendingIceRef.current = [];
+          if (!pendingIceMapRef.current.has(callId)) {
+            pendingIceMapRef.current.set(callId, []);
+          }
           setActiveCall({
             callId,
             chatId,
@@ -279,32 +397,32 @@ export function useRealtimeSignaling({
           const sdp = msg.sdp as RTCSessionDescriptionInit;
           if (pcRef.current && activeCallRef.current?.callId === callId) {
             stopRingtone();
-            await pcRef.current.setRemoteDescription(new RTCSessionDescription(sdp));
-            for (const cand of pendingIceRef.current) {
-              await pcRef.current.addIceCandidate(new RTCIceCandidate(cand)).catch(() => undefined);
-            }
-            pendingIceRef.current = [];
             setActiveCall((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    status: 'active',
-                    startedAtMs: prev.startedAtMs || Date.now(),
-                  }
-                : null
+              prev && prev.callId === callId && prev.status === 'ringing'
+                ? { ...prev, status: 'connecting' }
+                : prev
             );
-            void updateCallStatus(callId, 'active', 0);
+            await pcRef.current.setRemoteDescription(new RTCSessionDescription(sdp));
+            await drainPendingIce(callId, pcRef.current);
           }
           return;
         }
 
         if (type === 'call:ice') {
+          const callId = String(msg.callId || '');
           const candidate = msg.candidate as RTCIceCandidateInit | undefined;
-          if (!candidate) return;
-          if (pcRef.current && pcRef.current.remoteDescription) {
+          if (!candidate || !callId) return;
+
+          if (
+            pcRef.current &&
+            pcRef.current.remoteDescription &&
+            activeCallRef.current?.callId === callId
+          ) {
             await pcRef.current.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => undefined);
           } else {
-            pendingIceRef.current.push(candidate);
+            const list = pendingIceMapRef.current.get(callId) || [];
+            list.push(candidate);
+            pendingIceMapRef.current.set(callId, list);
           }
           return;
         }
@@ -318,6 +436,10 @@ export function useRealtimeSignaling({
       };
 
       ws.onclose = () => {
+        if (pingInterval !== null) {
+          window.clearInterval(pingInterval);
+          pingInterval = null;
+        }
         if (!cancelled) {
           reconnectTimeout = window.setTimeout(() => {
             void connect();
@@ -333,12 +455,15 @@ export function useRealtimeSignaling({
       if (reconnectTimeout !== null) {
         window.clearTimeout(reconnectTimeout);
       }
+      if (pingInterval !== null) {
+        window.clearInterval(pingInterval);
+      }
       wsRef.current?.close();
       wsRef.current = null;
     };
-  }, [cleanupCallMedia, sendWs, startRingtone, stopRingtone, user]);
+  }, [cleanupCallMedia, drainPendingIce, sendWs, startRingtone, stopRingtone, user]);
 
-  // Prune stale typing states every 3s
+  // Prune stale typing states every 2.5s
   useEffect(() => {
     const timer = window.setInterval(() => {
       const now = Date.now();
@@ -371,6 +496,36 @@ export function useRealtimeSignaling({
     [sendWs]
   );
 
+  const acquireUserMedia = useCallback(async (wantVideo: boolean): Promise<MediaStream | null> => {
+    const audioConstraints: MediaTrackConstraints = {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    };
+
+    if (!wantVideo) {
+      try {
+        return await navigator.mediaDevices.getUserMedia({ audio: audioConstraints, video: false });
+      } catch {
+        return null;
+      }
+    }
+
+    try {
+      return await navigator.mediaDevices.getUserMedia({
+        audio: audioConstraints,
+        video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+      });
+    } catch {
+      // Fallback to audio-only if camera hardware is unavailable or busy
+      try {
+        return await navigator.mediaDevices.getUserMedia({ audio: audioConstraints, video: false });
+      } catch {
+        return null;
+      }
+    }
+  }, []);
+
   const startCall = useCallback(
     async (params: {
       chatId: string;
@@ -383,13 +538,8 @@ export function useRealtimeSignaling({
       if (!user || activeCallRef.current) return;
       const callId = generateId('call');
 
-      let stream: MediaStream;
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: true,
-          video: params.callType === 'video',
-        });
-      } catch {
+      const stream = await acquireUserMedia(params.callType === 'video');
+      if (!stream) {
         onMediaError?.('media');
         return;
       }
@@ -397,7 +547,7 @@ export function useRealtimeSignaling({
       localStreamRef.current = stream;
       setLocalStream(stream);
       setIsMuted(false);
-      setIsCameraOff(params.callType === 'audio');
+      setIsCameraOff(params.callType === 'audio' || stream.getVideoTracks().length === 0);
 
       setActiveCall({
         callId,
@@ -425,10 +575,14 @@ export function useRealtimeSignaling({
         onPeerOfflineNotice?.();
       }
 
-      const pc = createPeerConnection(callId, params.peerUid);
+      const rtcConfig = await fetchIceConfiguration();
+      const pc = createPeerConnection(callId, params.peerUid, rtcConfig);
       stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
-      const offer = await pc.createOffer();
+      const offer = await pc.createOffer({
+        offerToReceiveAudio: true,
+        offerToReceiveVideo: params.callType === 'video',
+      });
       await pc.setLocalDescription(offer);
 
       sendWs({
@@ -439,12 +593,23 @@ export function useRealtimeSignaling({
         callerName: displayName,
         callerPhoto: user.photoURL || '',
         callType: params.callType,
-        sdp: offer,
+        sdp: pc.localDescription || offer,
       });
 
       startRingtone('outgoing');
     },
-    [createPeerConnection, displayName, onMediaError, onPeerOfflineNotice, onlineUids, sendWs, startRingtone, user]
+    [
+      acquireUserMedia,
+      createPeerConnection,
+      displayName,
+      fetchIceConfiguration,
+      onMediaError,
+      onPeerOfflineNotice,
+      onlineUids,
+      sendWs,
+      startRingtone,
+      user,
+    ]
   );
 
   const acceptIncomingCall = useCallback(async () => {
@@ -453,13 +618,8 @@ export function useRealtimeSignaling({
     if (!call || !offerData || call.callId !== offerData.callId) return;
 
     stopRingtone();
-    let stream: MediaStream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: call.callType === 'video',
-      });
-    } catch {
+    const stream = await acquireUserMedia(call.callType === 'video');
+    if (!stream) {
       onMediaError?.('media');
       sendWs({ type: 'call:decline', callId: call.callId, toUid: call.peerUid });
       void updateCallStatus(call.callId, 'declined', 0);
@@ -469,16 +629,16 @@ export function useRealtimeSignaling({
 
     localStreamRef.current = stream;
     setLocalStream(stream);
+    setIsMuted(false);
+    setIsCameraOff(call.callType === 'audio' || stream.getVideoTracks().length === 0);
     setActiveCall((prev) => (prev ? { ...prev, status: 'connecting' } : null));
 
-    const pc = createPeerConnection(call.callId, call.peerUid);
+    const rtcConfig = await fetchIceConfiguration();
+    const pc = createPeerConnection(call.callId, call.peerUid, rtcConfig);
     stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
     await pc.setRemoteDescription(new RTCSessionDescription(offerData.sdp));
-    for (const cand of pendingIceRef.current) {
-      await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => undefined);
-    }
-    pendingIceRef.current = [];
+    await drainPendingIce(call.callId, pc);
 
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
@@ -487,9 +647,18 @@ export function useRealtimeSignaling({
       type: 'call:answer',
       callId: call.callId,
       toUid: call.peerUid,
-      sdp: answer,
+      sdp: pc.localDescription || answer,
     });
-  }, [cleanupCallMedia, createPeerConnection, onMediaError, sendWs, stopRingtone]);
+  }, [
+    acquireUserMedia,
+    cleanupCallMedia,
+    createPeerConnection,
+    drainPendingIce,
+    fetchIceConfiguration,
+    onMediaError,
+    sendWs,
+    stopRingtone,
+  ]);
 
   const declineOrEndCall = useCallback(
     async (memberIdsForLog?: string[]) => {
@@ -499,7 +668,9 @@ export function useRealtimeSignaling({
         return;
       }
 
-      const elapsed = call.startedAtMs ? Math.max(1, Math.round((Date.now() - call.startedAtMs) / 1000)) : 0;
+      const elapsed = call.startedAtMs
+        ? Math.max(1, Math.round((Date.now() - call.startedAtMs) / 1000))
+        : 0;
 
       if (call.direction === 'incoming' && call.status === 'ringing') {
         sendWs({ type: 'call:decline', callId: call.callId, toUid: call.peerUid });
@@ -512,7 +683,10 @@ export function useRealtimeSignaling({
         if (memberIdsForLog && memberIdsForLog.length > 0) {
           const mins = Math.floor(elapsed / 60);
           const secs = elapsed % 60;
-          const durLabel = elapsed > 0 ? `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}` : '00:00';
+          const durLabel =
+            elapsed > 0
+              ? `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`
+              : '00:00';
           await sendChatMessage(call.chatId, user.uid, displayName, memberIdsForLog, {
             type: 'call',
             text: `${call.callType === 'video' ? 'video' : 'audio'} · ${durLabel}`,

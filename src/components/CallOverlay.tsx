@@ -1,4 +1,4 @@
-import { Mic, MicOff, Phone, PhoneOff, Video, VideoOff } from 'lucide-react';
+import { Mic, MicOff, Phone, PhoneOff, Video, VideoOff, Volume2 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { getCopy } from '../i18n/translations';
 import { ActiveCallSession, Language } from '../types/chat';
@@ -40,21 +40,51 @@ export function CallOverlay({
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
   const [elapsedSec, setElapsedSec] = useState(0);
+  const [audioBlocked, setAudioBlocked] = useState(false);
 
-  useEffect(() => {
-    if (localVideoRef.current && localStream) {
-      localVideoRef.current.srcObject = localStream;
-    }
-  }, [localStream]);
+  const isVideo = call?.callType === 'video';
+  const hasRemoteVideo = Boolean(
+    isVideo && remoteStream && remoteStream.getVideoTracks().length > 0
+  );
+  const hasLocalVideo = Boolean(
+    isVideo && localStream && localStream.getVideoTracks().length > 0
+  );
 
+  // Attach & play local camera stream
   useEffect(() => {
-    if (remoteVideoRef.current && remoteStream) {
-      remoteVideoRef.current.srcObject = remoteStream;
+    const videoEl = localVideoRef.current;
+    if (!videoEl || !localStream || !hasLocalVideo) return;
+    videoEl.muted = true;
+    videoEl.srcObject = localStream;
+    void videoEl.play().catch(() => undefined);
+  }, [localStream, hasLocalVideo, call?.status]);
+
+  // Attach & play remote stream (use <video> for video calls, <audio> for audio-only calls)
+  useEffect(() => {
+    if (!remoteStream) {
+      setAudioBlocked(false);
+      return;
     }
-    if (remoteAudioRef.current && remoteStream) {
-      remoteAudioRef.current.srcObject = remoteStream;
+
+    const playMedia = async (el: HTMLMediaElement | null) => {
+      if (!el) return;
+      el.srcObject = remoteStream;
+      el.muted = false;
+      el.volume = 1;
+      try {
+        await el.play();
+        setAudioBlocked(false);
+      } catch {
+        setAudioBlocked(true);
+      }
+    };
+
+    if (hasRemoteVideo) {
+      void playMedia(remoteVideoRef.current);
+    } else {
+      void playMedia(remoteAudioRef.current);
     }
-  }, [remoteStream]);
+  }, [remoteStream, hasRemoteVideo, call?.status]);
 
   useEffect(() => {
     if (!call || call.status !== 'active' || !call.startedAtMs) {
@@ -69,12 +99,22 @@ export function CallOverlay({
 
   if (!call) return null;
 
-  const isVideo = call.callType === 'video';
+  const handleUnlockAudio = () => {
+    const target = hasRemoteVideo ? remoteVideoRef.current : remoteAudioRef.current;
+    if (!target) return;
+    target.muted = false;
+    target.volume = 1;
+    void target
+      .play()
+      .then(() => setAudioBlocked(false))
+      .catch(() => undefined);
+  };
+
   const statusLabel =
     call.status === 'active'
       ? formatTimer(elapsedSec)
       : call.status === 'connecting'
-      ? t.connecting
+      ? t.mediaConnecting
       : call.direction === 'incoming'
       ? isVideo
         ? t.incomingVideoCall
@@ -83,45 +123,72 @@ export function CallOverlay({
 
   return (
     <div className="fixed inset-0 z-50 bg-slate-950 text-white flex flex-col justify-between overflow-hidden">
-      <audio ref={remoteAudioRef} autoPlay playsInline />
+      {/* Audio element used whenever remote video is not rendered */}
+      {!hasRemoteVideo && <audio ref={remoteAudioRef} autoPlay playsInline />}
 
-      {isVideo && remoteStream ? (
+      {hasRemoteVideo && (
         <video
           ref={remoteVideoRef}
           autoPlay
           playsInline
+          onLoadedMetadata={() => {
+            void remoteVideoRef.current?.play().catch(() => undefined);
+          }}
           className="absolute inset-0 w-full h-full object-cover"
         />
-      ) : null}
+      )}
 
-      <div className="absolute inset-0 bg-gradient-to-b from-black/70 via-black/30 to-black/80 pointer-events-none" />
+      <div className="absolute inset-0 bg-gradient-to-b from-black/65 via-transparent to-black/75 pointer-events-none" />
 
       {/* Top Info */}
       <div className="relative z-10 pt-safe px-6 py-8 text-center space-y-3">
-        {(!isVideo || call.status !== 'active') && (
+        {!hasRemoteVideo && (
           <div className="flex justify-center pb-2">
             <Avatar name={call.peerName} photoURL={call.peerPhoto} size="xl" />
           </div>
         )}
-        <h2 className="font-display text-2xl font-bold tracking-tight">{call.peerName}</h2>
-        <p className="text-sm text-slate-200 font-mono tabular-nums">{statusLabel}</p>
+        <h2 className="font-display text-2xl font-bold tracking-tight drop-shadow-xs">
+          {call.peerName}
+        </h2>
+        <p className="text-sm text-slate-200 font-mono tabular-nums drop-shadow-xs">
+          {statusLabel}
+        </p>
+
+        {audioBlocked && (
+          <div className="pt-2 flex justify-center">
+            <button
+              type="button"
+              onClick={handleUnlockAudio}
+              className="px-4 py-2 rounded-xl bg-[#00B87C] hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-2 shadow-lg"
+            >
+              <Volume2 className="w-4 h-4" />
+              <span>{t.tapToEnableAudio}</span>
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Local PiP Video */}
-      {isVideo && localStream && (
-        <div className="relative z-10 self-end mx-5 mb-4 w-28 sm:w-36 aspect-[3/4] rounded-2xl overflow-hidden border border-white/25 bg-slate-900 shadow-lg">
+      {hasLocalVideo && (
+        <div className="relative z-20 self-end mx-5 mb-4 w-28 sm:w-36 aspect-[3/4] rounded-2xl overflow-hidden border border-white/30 bg-slate-900 shadow-lg">
           <video
             ref={localVideoRef}
             autoPlay
             muted
             playsInline
-            className="w-full h-full object-cover"
+            onLoadedMetadata={() => {
+              if (localVideoRef.current) {
+                localVideoRef.current.muted = true;
+                void localVideoRef.current.play().catch(() => undefined);
+              }
+            }}
+            className={`w-full h-full object-cover scale-x-[-1] ${isCameraOff ? 'opacity-20' : ''}`}
           />
         </div>
       )}
 
       {/* Bottom Controls */}
-      <div className="relative z-10 pb-safe px-6 py-8 flex items-center justify-center gap-5">
+      <div className="relative z-20 pb-safe px-6 py-8 flex items-center justify-center gap-5">
         {call.direction === 'incoming' && call.status === 'ringing' ? (
           <>
             <button
