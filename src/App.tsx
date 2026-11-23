@@ -262,6 +262,7 @@ function MainApp() {
     activeCall,
     localStream,
     remoteStream,
+    relayVideoFrame,
     isMuted,
     isCameraOff,
     emitTyping,
@@ -270,6 +271,7 @@ function MainApp() {
     declineOrEndCall,
     toggleMute,
     toggleCamera,
+    unlockPlaybackAudio,
   } = useRealtimeSignaling({
     user,
     displayName: currentDisplayName,
@@ -610,6 +612,7 @@ function MainApp() {
         call={activeCall}
         localStream={localStream}
         remoteStream={remoteStream}
+        relayVideoFrame={relayVideoFrame}
         isMuted={isMuted}
         isCameraOff={isCameraOff}
         onAccept={() => void acceptIncomingCall()}
@@ -619,6 +622,7 @@ function MainApp() {
         }}
         onToggleMute={toggleMute}
         onToggleCamera={toggleCamera}
+        onUnlockAudio={unlockPlaybackAudio}
       />
 
       {/* Runtime Permissions Prompt Modal */}

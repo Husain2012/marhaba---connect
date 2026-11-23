@@ -9,12 +9,14 @@ interface CallOverlayProps {
   call: ActiveCallSession | null;
   localStream: MediaStream | null;
   remoteStream: MediaStream | null;
+  relayVideoFrame: string | null;
   isMuted: boolean;
   isCameraOff: boolean;
   onAccept: () => void;
   onDeclineOrEnd: () => void;
   onToggleMute: () => void;
   onToggleCamera: () => void;
+  onUnlockAudio: () => void;
 }
 
 function formatTimer(sec: number): string {
@@ -28,12 +30,14 @@ export function CallOverlay({
   call,
   localStream,
   remoteStream,
+  relayVideoFrame,
   isMuted,
   isCameraOff,
   onAccept,
   onDeclineOrEnd,
   onToggleMute,
   onToggleCamera,
+  onUnlockAudio,
 }: CallOverlayProps) {
   const t = getCopy(language);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -46,6 +50,8 @@ export function CallOverlay({
   const hasRemoteVideo = Boolean(
     isVideo && remoteStream && remoteStream.getVideoTracks().length > 0
   );
+  const hasRelayVideo = Boolean(isVideo && !hasRemoteVideo && relayVideoFrame);
+  const hasAnyRemoteVideo = hasRemoteVideo || hasRelayVideo;
   const hasLocalVideo = Boolean(
     isVideo && localStream && localStream.getVideoTracks().length > 0
   );
@@ -59,7 +65,7 @@ export function CallOverlay({
     void videoEl.play().catch(() => undefined);
   }, [localStream, hasLocalVideo, call?.status]);
 
-  // Attach & play remote stream (use <video> for video calls, <audio> for audio-only calls)
+  // Attach & play WebRTC remote stream when available
   useEffect(() => {
     if (!remoteStream) {
       setAudioBlocked(false);
@@ -81,10 +87,10 @@ export function CallOverlay({
 
     if (hasRemoteVideo) {
       void playMedia(remoteVideoRef.current);
-    } else {
+    } else if (!hasRelayVideo) {
       void playMedia(remoteAudioRef.current);
     }
-  }, [remoteStream, hasRemoteVideo, call?.status]);
+  }, [remoteStream, hasRemoteVideo, hasRelayVideo, call?.status]);
 
   useEffect(() => {
     if (!call || call.status !== 'active' || !call.startedAtMs) {
@@ -100,8 +106,12 @@ export function CallOverlay({
   if (!call) return null;
 
   const handleUnlockAudio = () => {
+    onUnlockAudio();
     const target = hasRemoteVideo ? remoteVideoRef.current : remoteAudioRef.current;
-    if (!target) return;
+    if (!target) {
+      setAudioBlocked(false);
+      return;
+    }
     target.muted = false;
     target.volume = 1;
     void target
@@ -122,11 +132,13 @@ export function CallOverlay({
       : t.calling;
 
   return (
-    <div className="fixed inset-0 z-50 bg-slate-950 text-white flex flex-col justify-between overflow-hidden">
-      {/* Audio element used whenever remote video is not rendered */}
+    <div
+      onClick={() => onUnlockAudio()}
+      className="fixed inset-0 z-50 bg-slate-950 text-white flex flex-col justify-between overflow-hidden"
+    >
       {!hasRemoteVideo && <audio ref={remoteAudioRef} autoPlay playsInline />}
 
-      {hasRemoteVideo && (
+      {hasRemoteVideo ? (
         <video
           ref={remoteVideoRef}
           autoPlay
@@ -136,13 +148,19 @@ export function CallOverlay({
           }}
           className="absolute inset-0 w-full h-full object-cover"
         />
-      )}
+      ) : hasRelayVideo && relayVideoFrame ? (
+        <img
+          src={relayVideoFrame}
+          alt={call.peerName}
+          className="absolute inset-0 w-full h-full object-cover"
+        />
+      ) : null}
 
       <div className="absolute inset-0 bg-gradient-to-b from-black/65 via-transparent to-black/75 pointer-events-none" />
 
       {/* Top Info */}
       <div className="relative z-10 pt-safe px-6 py-8 text-center space-y-3">
-        {!hasRemoteVideo && (
+        {!hasAnyRemoteVideo && (
           <div className="flex justify-center pb-2">
             <Avatar name={call.peerName} photoURL={call.peerPhoto} size="xl" />
           </div>
@@ -158,7 +176,10 @@ export function CallOverlay({
           <div className="pt-2 flex justify-center">
             <button
               type="button"
-              onClick={handleUnlockAudio}
+              onClick={(e) => {
+                e.stopPropagation();
+                handleUnlockAudio();
+              }}
               className="px-4 py-2 rounded-xl bg-[#00B87C] hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-2 shadow-lg"
             >
               <Volume2 className="w-4 h-4" />

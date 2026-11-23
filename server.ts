@@ -224,10 +224,11 @@ function broadcastPresence() {
   }
 }
 
-function sendToUser(targetUid: string, payload: unknown) {
+function sendToUser(targetUid: string, payload: unknown, excludeWs?: WebSocket) {
   const userSockets = socketsByUid.get(targetUid);
   if (!userSockets) return;
   for (const sock of userSockets) {
+    if (excludeWs && sock === excludeWs) continue;
     sendJson(sock, payload);
   }
 }
@@ -288,14 +289,59 @@ wss.on('connection', (ws) => {
       type === 'call:answer' ||
       type === 'call:ice' ||
       type === 'call:decline' ||
-      type === 'call:hangup'
+      type === 'call:hangup' ||
+      type === 'call:relay-ready'
     ) {
       const toUid = typeof msg.toUid === 'string' ? msg.toUid : '';
       if (!toUid) return;
-      sendToUser(toUid, {
-        ...msg,
-        fromUid: senderUid,
-      });
+      sendToUser(
+        toUid,
+        {
+          ...msg,
+          fromUid: senderUid,
+        },
+        ws
+      );
+      return;
+    }
+
+    if (type === 'call:relay-audio') {
+      const toUid = typeof msg.toUid === 'string' ? msg.toUid : '';
+      const callId = typeof msg.callId === 'string' ? msg.callId : '';
+      const pcm = typeof msg.pcm === 'string' ? msg.pcm : '';
+      const sr = typeof msg.sr === 'number' ? msg.sr : 16000;
+      if (!toUid || !callId || !pcm || pcm.length > 32768) return;
+      sendToUser(
+        toUid,
+        {
+          type: 'call:relay-audio',
+          callId,
+          fromUid: senderUid,
+          sr,
+          pcm,
+        },
+        ws
+      );
+      return;
+    }
+
+    if (type === 'call:relay-video') {
+      const toUid = typeof msg.toUid === 'string' ? msg.toUid : '';
+      const callId = typeof msg.callId === 'string' ? msg.callId : '';
+      const frame = typeof msg.frame === 'string' ? msg.frame : '';
+      if (!toUid || !callId || !frame || frame.length > 220000 || !frame.startsWith('data:image/jpeg;base64,')) {
+        return;
+      }
+      sendToUser(
+        toUid,
+        {
+          type: 'call:relay-video',
+          callId,
+          fromUid: senderUid,
+          frame,
+        },
+        ws
+      );
     }
   });
 
