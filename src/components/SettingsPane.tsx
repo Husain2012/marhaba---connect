@@ -1,7 +1,15 @@
-import { Check, Copy, Globe, LogOut, Moon, Smartphone, Sun } from 'lucide-react';
+import { Bell, Camera, Check, Copy, Globe, LogOut, Mic, Moon, ShieldCheck, Smartphone, Sun } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { getCopy } from '../i18n/translations';
 import { updateUserPrivatePhone, updateUserProfile } from '../lib/chatService';
+import {
+  AppPermissionsState,
+  PermissionGrantState,
+  requestAllRuntimePermissions,
+  requestCameraPermission,
+  requestMicrophonePermission,
+  requestNotificationPermission,
+} from '../lib/permissions';
 import { Language, ThemeMode, UserPrivate, UserPublic } from '../types/chat';
 import { Avatar } from './Avatar';
 import { PWAInstallButton } from './PWAInstallButton';
@@ -12,6 +20,8 @@ interface SettingsPaneProps {
   profile: UserPublic | null;
   privateInfo: UserPrivate | null;
   email: string;
+  permissions: AppPermissionsState;
+  onUpdatePermissions: (next: AppPermissionsState) => void;
   onChangeLanguage: (lang: Language) => void;
   onChangeTheme: (theme: ThemeMode) => void;
   onSignOut: () => void;
@@ -23,6 +33,8 @@ export function SettingsPane({
   profile,
   privateInfo,
   email,
+  permissions,
+  onUpdatePermissions,
   onChangeLanguage,
   onChangeTheme,
   onSignOut,
@@ -35,6 +47,7 @@ export function SettingsPane({
   const [saving, setSaving] = useState(false);
   const [savedFlag, setSavedFlag] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
+  const [reqPermsLoading, setReqPermsLoading] = useState(false);
 
   useEffect(() => {
     if (profile) {
@@ -261,6 +274,108 @@ export function SettingsPane({
         </section>
 
         <hr className="border-slate-100 dark:border-slate-800" />
+
+        {/* Runtime Permissions Section */}
+        <section className="p-4 rounded-2xl bg-slate-50 dark:bg-[#16202D] border border-slate-200/80 dark:border-slate-800 space-y-3">
+          <div className="flex items-center gap-2 text-sm font-semibold text-slate-900 dark:text-white">
+            <ShieldCheck className="w-4 h-4 text-[#007AFF]" />
+            <span>{t.permissions.title}</span>
+          </div>
+
+          <div className="space-y-2">
+            {(
+              [
+                { key: 'microphone', icon: Mic, label: t.permissions.micTitle, state: permissions.microphone },
+                { key: 'camera', icon: Camera, label: t.permissions.camTitle, state: permissions.camera },
+                { key: 'notifications', icon: Bell, label: t.permissions.notifTitle, state: permissions.notifications },
+              ] as Array<{
+                key: 'microphone' | 'camera' | 'notifications';
+                icon: typeof Mic;
+                label: string;
+                state: PermissionGrantState;
+              }>
+            ).map((row) => {
+              const Icon = row.icon;
+              const badgeLabel =
+                row.state === 'granted'
+                  ? t.permissions.granted
+                  : row.state === 'denied'
+                    ? t.permissions.denied
+                    : row.state === 'unsupported'
+                      ? t.permissions.unsupported
+                      : t.permissions.prompt;
+              const badgeColor =
+                row.state === 'granted'
+                  ? 'text-[#00B87C]'
+                  : row.state === 'denied'
+                    ? 'text-rose-500'
+                    : 'text-slate-500 dark:text-slate-400';
+
+              return (
+                <div key={row.key} className="flex items-center justify-between gap-2 text-xs">
+                  <div className="flex items-center gap-2 text-slate-700 dark:text-slate-200">
+                    <Icon className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400" />
+                    <span className="font-medium">{row.label}</span>
+                  </div>
+                  {row.state === 'prompt' ? (
+                    <button
+                      type="button"
+                      disabled={reqPermsLoading}
+                      onClick={async () => {
+                        setReqPermsLoading(true);
+                        try {
+                          const nextState =
+                            row.key === 'microphone'
+                              ? await requestMicrophonePermission()
+                              : row.key === 'camera'
+                                ? await requestCameraPermission()
+                                : await requestNotificationPermission();
+                          onUpdatePermissions({ ...permissions, [row.key]: nextState });
+                        } finally {
+                          setReqPermsLoading(false);
+                        }
+                      }}
+                      className="px-2.5 py-1 rounded-lg bg-[#007AFF] hover:bg-[#0066D6] text-white font-semibold"
+                    >
+                      {t.permissions.requestSingle}
+                    </button>
+                  ) : (
+                    <span className={`font-semibold ${badgeColor}`}>{badgeLabel}</span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          {(permissions.microphone === 'denied' ||
+            permissions.camera === 'denied' ||
+            permissions.notifications === 'denied') && (
+            <p className="text-[11px] text-amber-700 dark:text-amber-300 leading-relaxed">
+              {t.permissions.deniedHint}
+            </p>
+          )}
+
+          {(permissions.microphone !== 'granted' ||
+            permissions.camera !== 'granted' ||
+            permissions.notifications === 'prompt') && (
+            <button
+              type="button"
+              disabled={reqPermsLoading}
+              onClick={async () => {
+                setReqPermsLoading(true);
+                try {
+                  const next = await requestAllRuntimePermissions();
+                  onUpdatePermissions(next);
+                } finally {
+                  setReqPermsLoading(false);
+                }
+              }}
+              className="w-full min-h-[42px] px-3.5 py-2 rounded-xl bg-[#007AFF] hover:bg-[#0066D6] text-white text-xs font-semibold transition-colors disabled:opacity-60"
+            >
+              {reqPermsLoading ? t.permissions.requesting : t.permissions.allowAll}
+            </button>
+          )}
+        </section>
 
         {/* Android Export Readiness */}
         <section className="p-4 rounded-2xl bg-slate-50 dark:bg-[#16202D] border border-slate-200/80 dark:border-slate-800 space-y-2">

@@ -250,6 +250,27 @@ export function useRealtimeSignaling({
             status: 'ringing',
           });
           startRingtone('incoming');
+          if (
+            typeof Notification !== 'undefined' &&
+            Notification.permission === 'granted' &&
+            document.hidden
+          ) {
+            const title = callerName;
+            const body = callType === 'video' ? 'Incoming video call' : 'Incoming audio call';
+            if ('serviceWorker' in navigator) {
+              void navigator.serviceWorker.ready
+                .then((reg) =>
+                  reg.showNotification(title, {
+                    body,
+                    icon: '/pwa-192x192.png',
+                    tag: `call_${callId}`,
+                  })
+                )
+                .catch(() => new Notification(title, { body, icon: '/pwa-192x192.png' }));
+            } else {
+              new Notification(title, { body, icon: '/pwa-192x192.png' });
+            }
+          }
           return;
         }
 

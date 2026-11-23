@@ -10,6 +10,7 @@ import { ChatThreadPane } from './components/ChatThreadPane';
 import { ContactsPane } from './components/ContactsPane';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { NewChatModal } from './components/NewChatModal';
+import { RuntimePermissionsModal } from './components/RuntimePermissionsModal';
 import { SettingsPane } from './components/SettingsPane';
 import { useRealtimeSignaling } from './hooks/useRealtimeSignaling';
 import { getCopy } from './i18n/translations';
@@ -30,6 +31,7 @@ import {
 } from './lib/chatService';
 import { E2eeKeyPairData, getOrCreateMyE2eeKeys } from './lib/e2ee';
 import { auth, googleProvider } from './lib/firebase';
+import { AppPermissionsState, queryAppPermissions } from './lib/permissions';
 import {
   CallRecord,
   CallType,
@@ -73,6 +75,12 @@ function MainApp() {
     open: false,
     mode: 'direct',
   });
+  const [permissions, setPermissions] = useState<AppPermissionsState>({
+    microphone: 'prompt',
+    camera: 'prompt',
+    notifications: 'prompt',
+  });
+  const [showPermissionsModal, setShowPermissionsModal] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
   const t = getCopy(language);
@@ -141,6 +149,27 @@ function MainApp() {
       unsubChats();
       unsubCalls();
       unsubPrivate();
+    };
+  }, [authReady, user]);
+
+  // Query runtime permissions once signed in and prompt inside the app if not yet granted/dismissed
+  useEffect(() => {
+    if (!authReady || !user) return;
+    let cancelled = false;
+    void queryAppPermissions().then((state) => {
+      if (cancelled) return;
+      setPermissions(state);
+      const alreadyPrompted = localStorage.getItem('marhaba_perms_prompted_v1') === '1';
+      const needsAny =
+        state.microphone === 'prompt' ||
+        state.camera === 'prompt' ||
+        state.notifications === 'prompt';
+      if (!alreadyPrompted && needsAny) {
+        setShowPermissionsModal(true);
+      }
+    });
+    return () => {
+      cancelled = true;
     };
   }, [authReady, user]);
 
@@ -490,6 +519,8 @@ function MainApp() {
             profile={myProfile}
             privateInfo={privateInfo}
             email={user.email || ''}
+            permissions={permissions}
+            onUpdatePermissions={setPermissions}
             onChangeLanguage={(lang) => {
               setLanguage(lang);
               void updateUserProfile(user.uid, { language: lang }).catch(() => undefined);
@@ -588,6 +619,18 @@ function MainApp() {
         }}
         onToggleMute={toggleMute}
         onToggleCamera={toggleCamera}
+      />
+
+      {/* Runtime Permissions Prompt Modal */}
+      <RuntimePermissionsModal
+        language={language}
+        isOpen={showPermissionsModal}
+        permissions={permissions}
+        onUpdatePermissions={setPermissions}
+        onClose={() => {
+          localStorage.setItem('marhaba_perms_prompted_v1', '1');
+          setShowPermissionsModal(false);
+        }}
       />
 
       {/* Toast Notification */}
