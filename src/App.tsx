@@ -263,6 +263,7 @@ function MainApp() {
     localStream,
     remoteStream,
     relayVideoFrame,
+    callTransport,
     isMuted,
     isCameraOff,
     emitTyping,
@@ -613,6 +614,7 @@ function MainApp() {
         localStream={localStream}
         remoteStream={remoteStream}
         relayVideoFrame={relayVideoFrame}
+        callTransport={callTransport}
         isMuted={isMuted}
         isCameraOff={isCameraOff}
         onAccept={() => void acceptIncomingCall()}

@@ -1,6 +1,5 @@
-const CACHE_NAME = 'marhaba-connect-v1';
+const CACHE_NAME = 'marhaba-connect-v2';
 const APP_SHELL = [
-  '/',
   '/manifest.webmanifest',
   '/pwa-192x192.png',
   '/pwa-512x512.png',
@@ -35,9 +34,15 @@ self.addEventListener('fetch', (event) => {
   if (url.origin !== self.location.origin) return;
   if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/ws')) return;
 
-  if (request.mode === 'navigate') {
+  // Always network-first for HTML, JS, CSS so updates apply immediately on mobile/APK
+  if (
+    request.mode === 'navigate' ||
+    url.pathname.endsWith('.js') ||
+    url.pathname.endsWith('.css') ||
+    url.pathname === '/'
+  ) {
     event.respondWith(
-      fetch(request).catch(() => caches.match('/'))
+      fetch(request).catch(() => caches.match(request))
     );
     return;
   }

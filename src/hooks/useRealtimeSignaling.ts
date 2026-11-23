@@ -71,6 +71,22 @@ function base64ToFloat32(b64: string): Float32Array {
   return float32;
 }
 
+async function hasWebRtcInboundAudioBytes(pc: RTCPeerConnection | null): Promise<boolean> {
+  if (!pc || typeof pc.getStats !== 'function') return false;
+  try {
+    const stats = await pc.getStats();
+    let audioBytes = 0;
+    stats.forEach((report) => {
+      if (report.type === 'inbound-rtp' && report.kind === 'audio') {
+        audioBytes += Number((report as { bytesReceived?: number }).bytesReceived || 0);
+      }
+    });
+    return audioBytes > 0;
+  } catch {
+    return false;
+  }
+}
+
 interface UseRealtimeSignalingOptions {
   user: User | null;
   displayName: string;
@@ -90,6 +106,7 @@ export function useRealtimeSignaling({
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   const [relayVideoFrame, setRelayVideoFrame] = useState<string | null>(null);
+  const [callTransport, setCallTransport] = useState<'connecting' | 'p2p' | 'relay'>('connecting');
   const [isMuted, setIsMuted] = useState(false);
   const [isCameraOff, setIsCameraOff] = useState(false);
 
@@ -109,7 +126,7 @@ export function useRealtimeSignaling({
   const isMutedRef = useRef<boolean>(false);
   const isCameraOffRef = useRef<boolean>(false);
 
-  // Relay audio/video capture & playback refs
+  // Pre-unlocked AudioContexts (created synchronously on user gesture!)
   const isRelayActiveRef = useRef<boolean>(false);
   const captureCtxRef = useRef<AudioContext | null>(null);
   const captureProcRef = useRef<ScriptProcessorNode | null>(null);
@@ -177,17 +194,36 @@ export function useRealtimeSignaling({
     [stopRingtone]
   );
 
-  const unlockPlaybackAudio = useCallback(() => {
+  // Must be called synchronously inside user tap (startCall / acceptIncomingCall)
+  const unlockAudioEngines = useCallback(() => {
     try {
       const AudioCtx =
         window.AudioContext ||
         (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       if (!AudioCtx) return;
+
       if (!playbackCtxRef.current || playbackCtxRef.current.state === 'closed') {
         playbackCtxRef.current = new AudioCtx();
       }
       if (playbackCtxRef.current.state === 'suspended') {
         void playbackCtxRef.current.resume().catch(() => undefined);
+      }
+      // Play 1 silent sample to force Android/Samsung/iOS audio unlock
+      try {
+        const silentBuf = playbackCtxRef.current.createBuffer(1, 1, 22050);
+        const src = playbackCtxRef.current.createBufferSource();
+        src.buffer = silentBuf;
+        src.connect(playbackCtxRef.current.destination);
+        src.start(0);
+      } catch {
+        // ignore
+      }
+
+      if (!captureCtxRef.current || captureCtxRef.current.state === 'closed') {
+        captureCtxRef.current = new AudioCtx();
+      }
+      if (captureCtxRef.current.state === 'suspended') {
+        void captureCtxRef.current.resume().catch(() => undefined);
       }
     } catch {
       // Ignore if AudioContext unavailable
@@ -212,6 +248,7 @@ export function useRealtimeSignaling({
     }
     if (offscreenVideoRef.current) {
       offscreenVideoRef.current.srcObject = null;
+      offscreenVideoRef.current.remove();
       offscreenVideoRef.current = null;
     }
     if (captureProcRef.current) {
@@ -231,10 +268,6 @@ export function useRealtimeSignaling({
       }
       captureSourceRef.current = null;
     }
-    if (captureCtxRef.current) {
-      void captureCtxRef.current.close().catch(() => undefined);
-      captureCtxRef.current = null;
-    }
     nextPlayTimeRef.current = 0;
     setRelayVideoFrame(null);
   }, []);
@@ -246,22 +279,28 @@ export function useRealtimeSignaling({
       if (!stream) return;
 
       isRelayActiveRef.current = true;
-      unlockPlaybackAudio();
+      setCallTransport('relay');
+      unlockAudioEngines();
 
-      // 1. Live audio PCM capture -> WebSocket relay
+      // 1. Live audio PCM capture -> WebSocket relay (reuses pre-unlocked captureCtx)
       if (stream.getAudioTracks().length > 0) {
         try {
           const AudioCtx =
             window.AudioContext ||
             (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-          if (AudioCtx) {
-            const captureCtx = new AudioCtx();
+          const captureCtx =
+            captureCtxRef.current && captureCtxRef.current.state !== 'closed'
+              ? captureCtxRef.current
+              : AudioCtx
+                ? new AudioCtx()
+                : null;
+
+          if (captureCtx) {
             captureCtxRef.current = captureCtx;
             if (captureCtx.state === 'suspended') {
               void captureCtx.resume().catch(() => undefined);
             }
-            const audioOnlyStream = new MediaStream(stream.getAudioTracks());
-            const source = captureCtx.createMediaStreamSource(audioOnlyStream);
+            const source = captureCtx.createMediaStreamSource(stream);
             const processor = captureCtx.createScriptProcessor(2048, 1, 1);
             const silentGain = captureCtx.createGain();
             silentGain.gain.value = 0;
@@ -288,16 +327,26 @@ export function useRealtimeSignaling({
             captureProcRef.current = processor;
           }
         } catch {
-          // Ignore if ScriptProcessor fails
+          // Ignore if audio capture node fails
         }
       }
 
-      // 2. Live video frame capture -> WebSocket relay (if video call)
+      // 2. Live video frame capture -> WebSocket relay (attached to DOM so mobile Chrome/Samsung decodes frames!)
       if (callType === 'video' && stream.getVideoTracks().length > 0) {
         try {
           const hiddenVideo = document.createElement('video');
           hiddenVideo.muted = true;
           hiddenVideo.playsInline = true;
+          hiddenVideo.autoplay = true;
+          hiddenVideo.style.position = 'fixed';
+          hiddenVideo.style.width = '2px';
+          hiddenVideo.style.height = '2px';
+          hiddenVideo.style.bottom = '0';
+          hiddenVideo.style.right = '0';
+          hiddenVideo.style.opacity = '0.01';
+          hiddenVideo.style.pointerEvents = 'none';
+          hiddenVideo.style.zIndex = '-1';
+          document.body.appendChild(hiddenVideo);
           hiddenVideo.srcObject = stream;
           void hiddenVideo.play().catch(() => undefined);
           offscreenVideoRef.current = hiddenVideo;
@@ -339,40 +388,43 @@ export function useRealtimeSignaling({
       });
       void updateCallStatus(callId, 'active', 0);
     },
-    [sendWs, stopRingtone, unlockPlaybackAudio]
+    [sendWs, stopRingtone, unlockAudioEngines]
   );
 
   const playRelayAudio = useCallback(
     (pcmB64: string, sampleRate: number) => {
-      unlockPlaybackAudio();
       const ctx = playbackCtxRef.current;
-      if (!ctx || ctx.state === 'closed') return;
-      if (ctx.state === 'suspended') {
-        void ctx.resume().catch(() => undefined);
+      if (!ctx || ctx.state === 'closed') {
+        unlockAudioEngines();
+      }
+      const activeCtx = playbackCtxRef.current;
+      if (!activeCtx || activeCtx.state === 'closed') return;
+      if (activeCtx.state === 'suspended') {
+        void activeCtx.resume().catch(() => undefined);
       }
 
       try {
         const float32 = base64ToFloat32(pcmB64);
         if (float32.length === 0) return;
         const safeSr = sampleRate >= 8000 && sampleRate <= 48000 ? sampleRate : TARGET_SAMPLE_RATE;
-        const audioBuffer = ctx.createBuffer(1, float32.length, safeSr);
+        const audioBuffer = activeCtx.createBuffer(1, float32.length, safeSr);
         audioBuffer.copyToChannel(float32 as Float32Array<ArrayBuffer>, 0);
 
-        const source = ctx.createBufferSource();
+        const source = activeCtx.createBufferSource();
         source.buffer = audioBuffer;
-        source.connect(ctx.destination);
+        source.connect(activeCtx.destination);
 
-        const now = ctx.currentTime;
+        const now = activeCtx.currentTime;
         if (nextPlayTimeRef.current < now || nextPlayTimeRef.current > now + 0.4) {
           nextPlayTimeRef.current = now + 0.06;
         }
         source.start(nextPlayTimeRef.current);
         nextPlayTimeRef.current += audioBuffer.duration;
       } catch {
-        // Skip malformed audio frame
+        // Skip malformed frame
       }
     },
-    [unlockPlaybackAudio]
+    [unlockAudioEngines]
   );
 
   const scheduleRelayFallback = useCallback(
@@ -380,17 +432,27 @@ export function useRealtimeSignaling({
       if (relayFallbackTimerRef.current !== null) {
         window.clearTimeout(relayFallbackTimerRef.current);
       }
-      relayFallbackTimerRef.current = window.setTimeout(() => {
+      relayFallbackTimerRef.current = window.setTimeout(async () => {
         const cur = activeCallRef.current;
         if (!cur || cur.callId !== callId) return;
-        const hasRemoteAudio = Boolean(
-          remoteStreamRef.current && remoteStreamRef.current.getAudioTracks().length > 0
-        );
-        if (!webrtcConnectedRef.current || !hasRemoteAudio) {
+        const hasRealBytes = await hasWebRtcInboundAudioBytes(pcRef.current);
+        if (!webrtcConnectedRef.current || !hasRealBytes) {
           startRelayMedia(callId, peerUid, callType);
           sendWs({ type: 'call:relay-ready', callId, toUid: peerUid });
+        } else {
+          setCallTransport('p2p');
+          stopRingtone();
+          setActiveCall((prev) => {
+            if (!prev || prev.callId !== callId) return prev;
+            return {
+              ...prev,
+              status: 'active',
+              startedAtMs: prev.startedAtMs || Date.now(),
+            };
+          });
+          void updateCallStatus(callId, 'active', 0);
         }
-      }, 3200);
+      }, 2800);
     },
     [sendWs, startRelayMedia]
   );
@@ -418,6 +480,10 @@ export function useRealtimeSignaling({
       localStreamRef.current.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
     }
+    if (captureCtxRef.current) {
+      void captureCtxRef.current.close().catch(() => undefined);
+      captureCtxRef.current = null;
+    }
     if (playbackCtxRef.current) {
       void playbackCtxRef.current.close().catch(() => undefined);
       playbackCtxRef.current = null;
@@ -428,6 +494,7 @@ export function useRealtimeSignaling({
     setLocalStream(null);
     setRemoteStream(null);
     setRelayVideoFrame(null);
+    setCallTransport('connecting');
     setIsMuted(false);
     setIsCameraOff(false);
     setActiveCall(null);
@@ -475,16 +542,16 @@ export function useRealtimeSignaling({
       iceRestartedRef.current = false;
       webrtcConnectedRef.current = false;
 
-      const emitRemoteStream = () => {
+      const emitRemoteStream = async () => {
         const tracks = remote.getTracks();
         if (tracks.length > 0) {
           setRemoteStream(new MediaStream(tracks));
-          if (
-            webrtcConnectedRef.current &&
-            remote.getAudioTracks().length > 0 &&
-            isRelayActiveRef.current
-          ) {
-            stopRelayMedia();
+          if (webrtcConnectedRef.current && isRelayActiveRef.current) {
+            const hasRealBytes = await hasWebRtcInboundAudioBytes(pc);
+            if (hasRealBytes) {
+              stopRelayMedia();
+              setCallTransport('p2p');
+            }
           }
         }
       };
@@ -498,10 +565,10 @@ export function useRealtimeSignaling({
         for (const track of incomingTracks) {
           if (!remote.getTracks().some((t) => t.id === track.id)) {
             remote.addTrack(track);
-            track.onunmute = () => emitRemoteStream();
+            track.onunmute = () => void emitRemoteStream();
           }
         }
-        emitRemoteStream();
+        void emitRemoteStream();
       };
 
       pc.onicecandidate = (event) => {
@@ -515,27 +582,31 @@ export function useRealtimeSignaling({
         }
       };
 
-      const markConnected = () => {
+      const markConnected = async () => {
         webrtcConnectedRef.current = true;
         if (iceFailTimerRef.current !== null) {
           window.clearTimeout(iceFailTimerRef.current);
           iceFailTimerRef.current = null;
         }
-        // Only disable relay if WebRTC actually delivered remote audio
-        if (remote.getAudioTracks().length > 0 && isRelayActiveRef.current) {
-          stopRelayMedia();
+        // Only disable relay and mark P2P active once WebRTC actually has inbound audio bytes
+        const hasRealBytes = await hasWebRtcInboundAudioBytes(pc);
+        if (hasRealBytes) {
+          if (isRelayActiveRef.current) {
+            stopRelayMedia();
+          }
+          setCallTransport('p2p');
+          stopRingtone();
+          setActiveCall((prev) => {
+            if (!prev || prev.callId !== callId) return prev;
+            if (prev.status === 'active' && prev.startedAtMs) return prev;
+            return {
+              ...prev,
+              status: 'active',
+              startedAtMs: prev.startedAtMs || Date.now(),
+            };
+          });
+          void updateCallStatus(callId, 'active', 0);
         }
-        stopRingtone();
-        setActiveCall((prev) => {
-          if (!prev || prev.callId !== callId) return prev;
-          if (prev.status === 'active' && prev.startedAtMs) return prev;
-          return {
-            ...prev,
-            status: 'active',
-            startedAtMs: prev.startedAtMs || Date.now(),
-          };
-        });
-        void updateCallStatus(callId, 'active', 0);
       };
 
       const handlePossibleFailure = () => {
@@ -543,7 +614,6 @@ export function useRealtimeSignaling({
           iceRestartedRef.current = true;
           pc.restartIce();
         }
-        // Engage WebSocket media relay immediately when WebRTC ICE fails
         const cur = activeCallRef.current;
         if (cur && cur.callId === callId && !isRelayActiveRef.current) {
           startRelayMedia(callId, peerUid, callType);
@@ -553,7 +623,7 @@ export function useRealtimeSignaling({
 
       pc.onconnectionstatechange = () => {
         if (pc.connectionState === 'connected') {
-          markConnected();
+          void markConnected();
         } else if (pc.connectionState === 'failed') {
           handlePossibleFailure();
         }
@@ -561,7 +631,7 @@ export function useRealtimeSignaling({
 
       pc.oniceconnectionstatechange = () => {
         if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-          markConnected();
+          void markConnected();
         } else if (pc.iceConnectionState === 'failed') {
           handlePossibleFailure();
         }
@@ -658,6 +728,7 @@ export function useRealtimeSignaling({
           if (!pendingIceMapRef.current.has(callId)) {
             pendingIceMapRef.current.set(callId, []);
           }
+          setCallTransport('connecting');
           setActiveCall({
             callId,
             chatId,
@@ -885,7 +956,7 @@ export function useRealtimeSignaling({
       memberIds: string[];
     }) => {
       if (!user || activeCallRef.current) return;
-      unlockPlaybackAudio();
+      unlockAudioEngines();
       const callId = generateId('call');
 
       const stream = await acquireUserMedia(params.callType === 'video');
@@ -896,6 +967,7 @@ export function useRealtimeSignaling({
 
       localStreamRef.current = stream;
       setLocalStream(stream);
+      setCallTransport('connecting');
       setIsMuted(false);
       setIsCameraOff(params.callType === 'audio' || stream.getVideoTracks().length === 0);
 
@@ -958,7 +1030,7 @@ export function useRealtimeSignaling({
       onlineUids,
       sendWs,
       startRingtone,
-      unlockPlaybackAudio,
+      unlockAudioEngines,
       user,
     ]
   );
@@ -968,7 +1040,7 @@ export function useRealtimeSignaling({
     const offerData = pendingOfferRef.current;
     if (!call || !offerData || call.callId !== offerData.callId) return;
 
-    unlockPlaybackAudio();
+    unlockAudioEngines();
     stopRingtone();
     const stream = await acquireUserMedia(call.callType === 'video');
     if (!stream) {
@@ -981,6 +1053,7 @@ export function useRealtimeSignaling({
 
     localStreamRef.current = stream;
     setLocalStream(stream);
+    setCallTransport('connecting');
     setIsMuted(false);
     setIsCameraOff(call.callType === 'audio' || stream.getVideoTracks().length === 0);
     setActiveCall((prev) => (prev ? { ...prev, status: 'connecting' } : null));
@@ -1013,7 +1086,7 @@ export function useRealtimeSignaling({
     scheduleRelayFallback,
     sendWs,
     stopRingtone,
-    unlockPlaybackAudio,
+    unlockAudioEngines,
   ]);
 
   const declineOrEndCall = useCallback(
@@ -1081,6 +1154,7 @@ export function useRealtimeSignaling({
     localStream,
     remoteStream,
     relayVideoFrame,
+    callTransport,
     isMuted,
     isCameraOff,
     emitTyping,
@@ -1089,6 +1163,6 @@ export function useRealtimeSignaling({
     declineOrEndCall,
     toggleMute,
     toggleCamera,
-    unlockPlaybackAudio,
+    unlockPlaybackAudio: unlockAudioEngines,
   };
 }

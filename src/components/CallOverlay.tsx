@@ -10,6 +10,7 @@ interface CallOverlayProps {
   localStream: MediaStream | null;
   remoteStream: MediaStream | null;
   relayVideoFrame: string | null;
+  callTransport: 'connecting' | 'p2p' | 'relay';
   isMuted: boolean;
   isCameraOff: boolean;
   onAccept: () => void;
@@ -31,6 +32,7 @@ export function CallOverlay({
   localStream,
   remoteStream,
   relayVideoFrame,
+  callTransport,
   isMuted,
   isCameraOff,
   onAccept,
@@ -171,6 +173,11 @@ export function CallOverlay({
         <p className="text-sm text-slate-200 font-mono tabular-nums drop-shadow-xs">
           {statusLabel}
         </p>
+        {call.status === 'active' && (
+          <p className="text-[11px] text-emerald-300/90 font-medium drop-shadow-xs">
+            {callTransport === 'relay' ? t.modeRelay : t.modeP2p}
+          </p>
+        )}
 
         {audioBlocked && (
           <div className="pt-2 flex justify-center">
