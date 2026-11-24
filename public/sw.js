@@ -1,4 +1,4 @@
-const CACHE_NAME = 'marhaba-connect-v4';
+const CACHE_NAME = 'marhaba-connect-v5';
 const APP_SHELL = [
   '/manifest.webmanifest',
   '/pwa-192x192.png',
@@ -49,9 +49,15 @@ self.addEventListener('fetch', (event) => {
 
   event.respondWith(
     caches.match(request).then((cached) => {
-      if (cached) return cached;
+      if (cached) {
+        const cachedCt = (cached.headers.get('content-type') || '').toLowerCase();
+        if (!(cachedCt.includes('text/html') && request.destination !== 'document')) {
+          return cached;
+        }
+      }
       return fetch(request).then((response) => {
-        if (response && response.status === 200 && response.type === 'basic') {
+        const ct = (response?.headers.get('content-type') || '').toLowerCase();
+        if (response && response.status === 200 && response.type === 'basic' && !ct.includes('text/html')) {
           const clone = response.clone();
           caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
         }

@@ -802,7 +802,15 @@ async function startServer() {
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distDir));
-    app.get('*', (_req, res) => {
+    app.get('*', (req, res) => {
+      if (
+        req.path.startsWith('/assets/') ||
+        req.path.startsWith('/src/assets/') ||
+        /\.(?:jpg|jpeg|png|gif|webp|svg|ico|css|js|mjs|map|woff2?|ttf|json|webmanifest)$/i.test(req.path)
+      ) {
+        res.status(404).end();
+        return;
+      }
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }
