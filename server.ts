@@ -340,7 +340,7 @@ wss.on('connection', (ws, req) => {
       if (!toUid || !callId || !frame || frame.length > 220000 || !frame.startsWith('data:image/jpeg;base64,')) {
         return;
       }
-      // Drop video frames if recipient socket is backed up so audio packets stay real-time
+      // Drop video frames only if recipient socket is heavily backed up so audio packets stay real-time
       sendToUser(
         toUid,
         {
@@ -350,7 +350,7 @@ wss.on('connection', (ws, req) => {
           frame,
         },
         ws,
-        96 * 1024
+        256 * 1024
       );
     }
   });

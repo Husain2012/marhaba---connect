@@ -1,4 +1,4 @@
-const CACHE_NAME = 'marhaba-connect-v2';
+const CACHE_NAME = 'marhaba-connect-v3';
 const APP_SHELL = [
   '/manifest.webmanifest',
   '/pwa-192x192.png',

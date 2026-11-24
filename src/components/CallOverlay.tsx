@@ -18,6 +18,7 @@ interface CallOverlayProps {
   onToggleMute: () => void;
   onToggleCamera: () => void;
   onUnlockAudio: () => void;
+  onLocalVideoElement?: (el: HTMLVideoElement | null) => void;
 }
 
 function formatTimer(sec: number): string {
@@ -40,6 +41,7 @@ export function CallOverlay({
   onToggleMute,
   onToggleCamera,
   onUnlockAudio,
+  onLocalVideoElement,
 }: CallOverlayProps) {
   const t = getCopy(language);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -67,14 +69,18 @@ export function CallOverlay({
     }
   }, [remoteStream, callTransport]);
 
-  // Attach & play local camera stream
+  // Attach & play local camera stream + register element for relay frame capture
   useEffect(() => {
     const videoEl = localVideoRef.current;
+    onLocalVideoElement?.(videoEl);
     if (!videoEl || !localStream || !hasLocalVideo) return;
     videoEl.muted = true;
     videoEl.srcObject = localStream;
     void videoEl.play().catch(() => undefined);
-  }, [localStream, hasLocalVideo, call?.status]);
+    return () => {
+      onLocalVideoElement?.(null);
+    };
+  }, [localStream, hasLocalVideo, call?.status, onLocalVideoElement]);
 
   // Attach & play WebRTC remote stream ONLY when not in relay mode
   useEffect(() => {
@@ -85,25 +91,23 @@ export function CallOverlay({
       return;
     }
 
-    const playMedia = async (el: HTMLMediaElement | null) => {
-      if (!el) return;
-      el.srcObject = remoteStream;
-      el.muted = false;
-      el.volume = 1;
-      try {
-        await el.play();
-        setAudioBlocked(false);
-      } catch {
-        setAudioBlocked(true);
-      }
-    };
-
-    if (hasRemoteVideo) {
-      void playMedia(remoteVideoRef.current);
-    } else if (!hasRelayVideo) {
-      void playMedia(remoteAudioRef.current);
+    if (hasRemoteVideo && remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = remoteStream;
+      remoteVideoRef.current.muted = true; // Keep <video> muted so mobile autoplay never blocks video
+      void remoteVideoRef.current.play().catch(() => undefined);
     }
-  }, [remoteStream, callTransport, hasRemoteVideo, hasRelayVideo, call?.status]);
+
+    const audioEl = remoteAudioRef.current;
+    if (audioEl) {
+      audioEl.srcObject = remoteStream;
+      audioEl.muted = false;
+      audioEl.volume = 1;
+      void audioEl
+        .play()
+        .then(() => setAudioBlocked(false))
+        .catch(() => setAudioBlocked(true));
+    }
+  }, [remoteStream, callTransport, hasRemoteVideo, call?.status]);
 
   useEffect(() => {
     if (!call || call.status !== 'active' || !call.startedAtMs) {
@@ -124,7 +128,7 @@ export function CallOverlay({
       setAudioBlocked(false);
       return;
     }
-    const target = hasRemoteVideo ? remoteVideoRef.current : remoteAudioRef.current;
+    const target = remoteAudioRef.current;
     if (!target) {
       setAudioBlocked(false);
       return;
@@ -153,7 +157,7 @@ export function CallOverlay({
       onClick={() => onUnlockAudio()}
       className="fixed inset-0 z-50 bg-slate-950 text-white flex flex-col justify-between overflow-hidden"
     >
-      {callTransport !== 'relay' && !hasRemoteVideo && (
+      {callTransport !== 'relay' && (
         <audio ref={remoteAudioRef} autoPlay playsInline />
       )}
 
@@ -161,6 +165,7 @@ export function CallOverlay({
         <video
           ref={remoteVideoRef}
           autoPlay
+          muted
           playsInline
           onLoadedData={() => {
             if (remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0) {
@@ -173,7 +178,10 @@ export function CallOverlay({
             }
           }}
           onLoadedMetadata={() => {
-            void remoteVideoRef.current?.play().catch(() => undefined);
+            if (remoteVideoRef.current) {
+              remoteVideoRef.current.muted = true;
+              void remoteVideoRef.current.play().catch(() => undefined);
+            }
           }}
           className="absolute inset-0 w-full h-full object-cover"
         />

@@ -273,6 +273,7 @@ function MainApp() {
     toggleMute,
     toggleCamera,
     unlockPlaybackAudio,
+    registerLocalVideoElement,
   } = useRealtimeSignaling({
     user,
     displayName: currentDisplayName,
@@ -625,6 +626,7 @@ function MainApp() {
         onToggleMute={toggleMute}
         onToggleCamera={toggleCamera}
         onUnlockAudio={unlockPlaybackAudio}
+        onLocalVideoElement={registerLocalVideoElement}
       />
 
       {/* Runtime Permissions Prompt Modal */}

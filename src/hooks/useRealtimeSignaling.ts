@@ -63,32 +63,32 @@ function base64ToFloat32(b64: string): Float32Array {
   return float32;
 }
 
-function blobToDataUrl(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      if (typeof reader.result === 'string') {
-        resolve(reader.result);
-      } else {
-        reject(new Error('Failed to encode frame'));
-      }
-    };
-    reader.onerror = () => reject(reader.error || new Error('FileReader error'));
-    reader.readAsDataURL(blob);
-  });
-}
-
-async function hasWebRtcInboundAudioBytes(pc: RTCPeerConnection | null): Promise<boolean> {
+async function hasWebRtcInboundMediaBytes(
+  pc: RTCPeerConnection | null,
+  requireVideo: boolean
+): Promise<boolean> {
   if (!pc || typeof pc.getStats !== 'function') return false;
   try {
     const stats = await pc.getStats();
     let audioBytes = 0;
+    let videoBytes = 0;
+    let hasRemoteVideoTrack = false;
+    pc.getReceivers().forEach((r) => {
+      if (r.track && r.track.kind === 'video') {
+        hasRemoteVideoTrack = true;
+      }
+    });
     stats.forEach((report) => {
       if (report.type === 'inbound-rtp' && report.kind === 'audio') {
         audioBytes += Number((report as { bytesReceived?: number }).bytesReceived || 0);
       }
+      if (report.type === 'inbound-rtp' && report.kind === 'video') {
+        videoBytes += Number((report as { bytesReceived?: number }).bytesReceived || 0);
+      }
     });
-    return audioBytes > 0;
+    if (audioBytes <= 0) return false;
+    if (requireVideo && hasRemoteVideoTrack && videoBytes <= 0) return false;
+    return true;
   } catch {
     return false;
   }
@@ -159,6 +159,11 @@ export function useRealtimeSignaling({
 
   const relayVideoTimerRef = useRef<number | null>(null);
   const offscreenVideoRef = useRef<HTMLVideoElement | null>(null);
+  const localPreviewVideoElRef = useRef<HTMLVideoElement | null>(null);
+
+  const registerLocalVideoElement = useCallback((el: HTMLVideoElement | null) => {
+    localPreviewVideoElRef.current = el;
+  }, []);
 
   useEffect(() => {
     activeCallRef.current = activeCall;
@@ -505,113 +510,73 @@ export function useRealtimeSignaling({
         }
       }
 
-      // 2. Live video frame capture -> async JPEG encoding with audio priority backpressure
-      const videoTrack = stream.getVideoTracks()[0];
-      if (callType === 'video' && videoTrack) {
+      // 2. Live video frame capture directly from visible preview <video> (or DOM fallback)
+      if (callType === 'video') {
         try {
-          type ImageCaptureCtor = new (track: MediaStreamTrack) => { grabFrame: () => Promise<ImageBitmap> };
-          const ImageCaptureApi = (window as unknown as { ImageCapture?: ImageCaptureCtor }).ImageCapture;
-          const imageCapture = ImageCaptureApi ? new ImageCaptureApi(videoTrack) : null;
           let hiddenVideo: HTMLVideoElement | null = null;
-
-          const ensureHiddenVideo = () => {
-            if (hiddenVideo) return hiddenVideo;
-            const el = document.createElement('video');
-            el.muted = true;
-            el.playsInline = true;
-            el.autoplay = true;
-            el.style.position = 'fixed';
-            el.style.width = '16px';
-            el.style.height = '16px';
-            el.style.bottom = '0';
-            el.style.right = '0';
-            el.style.opacity = '0.05';
-            el.style.pointerEvents = 'none';
-            el.style.zIndex = '0';
-            document.body.appendChild(el);
-            el.srcObject = new MediaStream([videoTrack]);
-            void el.play().catch(() => undefined);
-            offscreenVideoRef.current = el;
-            hiddenVideo = el;
-            return el;
+          let attachedTrackId: string | null = null;
+          const ensureHiddenVideo = (track: MediaStreamTrack) => {
+            if (hiddenVideo && attachedTrackId === track.id) return hiddenVideo;
+            if (!hiddenVideo) {
+              const el = document.createElement('video');
+              el.muted = true;
+              el.playsInline = true;
+              el.autoplay = true;
+              el.style.position = 'fixed';
+              el.style.width = '24px';
+              el.style.height = '24px';
+              el.style.bottom = '0';
+              el.style.right = '0';
+              el.style.opacity = '0.05';
+              el.style.pointerEvents = 'none';
+              el.style.zIndex = '0';
+              document.body.appendChild(el);
+              offscreenVideoRef.current = el;
+              hiddenVideo = el;
+            }
+            attachedTrackId = track.id;
+            hiddenVideo.srcObject = new MediaStream([track]);
+            void hiddenVideo.play().catch(() => undefined);
+            return hiddenVideo;
           };
-
-          if (!imageCapture) {
-            ensureHiddenVideo();
-          }
 
           const canvas = document.createElement('canvas');
           const ctx = canvas.getContext('2d');
-          let encoding = false;
 
-          const encodeAndSend = () => {
-            if (!ctx) {
-              encoding = false;
-              return;
-            }
-            canvas.toBlob(
-              async (blob) => {
-                try {
-                  if (!blob || !isRelayActiveRef.current || activeCallRef.current?.callId !== callId) {
-                    return;
-                  }
-                  if (wsRef.current && wsRef.current.bufferedAmount > 48000) {
-                    return;
-                  }
-                  const frame = await blobToDataUrl(blob);
-                  sendWs({
-                    type: 'call:relay-video',
-                    callId,
-                    toUid: peerUid,
-                    frame,
-                  });
-                } catch {
-                  // skip frame
-                } finally {
-                  encoding = false;
-                }
-              },
-              'image/jpeg',
-              0.46
-            );
-          };
-
-          relayVideoTimerRef.current = window.setInterval(async () => {
-            if (!isRelayActiveRef.current || isCameraOffRef.current || encoding) return;
+          relayVideoTimerRef.current = window.setInterval(() => {
+            if (!isRelayActiveRef.current || isCameraOffRef.current) return;
             if (activeCallRef.current?.callId !== callId) return;
             if (!ctx) return;
-            // Never queue video ahead of live voice packets
-            if (wsRef.current && wsRef.current.bufferedAmount > 40000) return;
+            const liveTrack = localStreamRef.current?.getVideoTracks()[0];
+            if (!liveTrack || liveTrack.readyState !== 'live') return;
+            // Prioritize audio if WebSocket send queue is heavily backed up
+            if (wsRef.current && wsRef.current.bufferedAmount > 120000) return;
 
-            encoding = true;
-            try {
-              if (imageCapture) {
-                const bitmap = await imageCapture.grabFrame();
-                const maxW = 280;
-                const scale = Math.min(1, maxW / Math.max(1, bitmap.width));
-                canvas.width = Math.max(1, Math.round(bitmap.width * scale));
-                canvas.height = Math.max(1, Math.round(bitmap.height * scale));
-                ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-                bitmap.close();
-                encodeAndSend();
-                return;
-              }
-            } catch {
-              // Fall back to DOM video element below
+            const previewEl = localPreviewVideoElRef.current;
+            const sourceEl =
+              previewEl && previewEl.readyState >= 2 && previewEl.videoWidth > 0
+                ? previewEl
+                : ensureHiddenVideo(liveTrack);
+
+            if (!sourceEl || sourceEl.readyState < 2 || sourceEl.videoWidth === 0) {
+              return;
             }
 
-            const fallbackEl = ensureHiddenVideo();
-            if (fallbackEl.readyState >= 2 && fallbackEl.videoWidth > 0) {
-              const maxW = 280;
-              const scale = Math.min(1, maxW / fallbackEl.videoWidth);
-              canvas.width = Math.max(1, Math.round(fallbackEl.videoWidth * scale));
-              canvas.height = Math.max(1, Math.round(fallbackEl.videoHeight * scale));
-              ctx.drawImage(fallbackEl, 0, 0, canvas.width, canvas.height);
-              encodeAndSend();
-            } else {
-              encoding = false;
+            const maxW = 240;
+            const scale = Math.min(1, maxW / sourceEl.videoWidth);
+            canvas.width = Math.max(1, Math.round(sourceEl.videoWidth * scale));
+            canvas.height = Math.max(1, Math.round(sourceEl.videoHeight * scale));
+            ctx.drawImage(sourceEl, 0, 0, canvas.width, canvas.height);
+            const frame = canvas.toDataURL('image/jpeg', 0.42);
+            if (frame && frame.startsWith('data:image/jpeg;base64,')) {
+              sendWs({
+                type: 'call:relay-video',
+                callId,
+                toUid: peerUid,
+                frame,
+              });
             }
-          }, 160);
+          }, 180);
         } catch {
           // Ignore canvas capture error
         }
@@ -695,7 +660,7 @@ export function useRealtimeSignaling({
       relayFallbackTimerRef.current = window.setTimeout(async () => {
         const cur = activeCallRef.current;
         if (!cur || cur.callId !== callId) return;
-        const hasRealBytes = await hasWebRtcInboundAudioBytes(pcRef.current);
+        const hasRealBytes = await hasWebRtcInboundMediaBytes(pcRef.current, callType === 'video');
         if (!webrtcConnectedRef.current || !hasRealBytes) {
           startRelayMedia(callId, peerUid, callType);
           sendWs({ type: 'call:relay-ready', callId, toUid: peerUid });
@@ -790,15 +755,8 @@ export function useRealtimeSignaling({
 
       const emitRemoteStream = async () => {
         const tracks = remote.getTracks();
-        if (tracks.length > 0) {
+        if (tracks.length > 0 && !isRelayActiveRef.current) {
           setRemoteStream(new MediaStream(tracks));
-          if (webrtcConnectedRef.current && isRelayActiveRef.current) {
-            const hasRealBytes = await hasWebRtcInboundAudioBytes(pc);
-            if (hasRealBytes) {
-              stopRelayMedia();
-              setCallTransport('p2p');
-            }
-          }
         }
       };
 
@@ -829,17 +787,15 @@ export function useRealtimeSignaling({
       };
 
       const markConnected = async () => {
+        if (isRelayActiveRef.current) return;
         webrtcConnectedRef.current = true;
         if (iceFailTimerRef.current !== null) {
           window.clearTimeout(iceFailTimerRef.current);
           iceFailTimerRef.current = null;
         }
-        // Only disable relay and mark P2P active once WebRTC actually has inbound audio bytes
-        const hasRealBytes = await hasWebRtcInboundAudioBytes(pc);
-        if (hasRealBytes) {
-          if (isRelayActiveRef.current) {
-            stopRelayMedia();
-          }
+        // Only mark P2P active once WebRTC actually has real inbound media bytes
+        const hasRealBytes = await hasWebRtcInboundMediaBytes(pc, callType === 'video');
+        if (hasRealBytes && !isRelayActiveRef.current) {
           setCallTransport('p2p');
           stopRingtone();
           setActiveCall((prev) => {
@@ -1380,14 +1336,37 @@ export function useRealtimeSignaling({
     setIsMuted(nextMuted);
   }, [isMuted]);
 
-  const toggleCamera = useCallback(() => {
-    if (!localStreamRef.current) return;
+  const toggleCamera = useCallback(async () => {
+    const stream = localStreamRef.current;
+    if (!stream) return;
+    const videoTracks = stream.getVideoTracks();
+    if (videoTracks.length === 0) {
+      // If camera initially failed or wasn't acquired, try acquiring camera now
+      try {
+        const camStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+          audio: false,
+        });
+        const newTrack = camStream.getVideoTracks()[0];
+        if (newTrack) {
+          stream.addTrack(newTrack);
+          setLocalStream(new MediaStream(stream.getTracks()));
+          setIsCameraOff(false);
+          if (pcRef.current) {
+            pcRef.current.addTrack(newTrack, stream);
+          }
+        }
+      } catch {
+        onMediaError?.('media');
+      }
+      return;
+    }
     const nextOff = !isCameraOff;
-    localStreamRef.current.getVideoTracks().forEach((t) => {
+    videoTracks.forEach((t) => {
       t.enabled = !nextOff;
     });
     setIsCameraOff(nextOff);
-  }, [isCameraOff]);
+  }, [isCameraOff, onMediaError]);
 
   return {
     onlineUids,
@@ -1406,5 +1385,6 @@ export function useRealtimeSignaling({
     toggleMute,
     toggleCamera,
     unlockPlaybackAudio: unlockAudioEngines,
+    registerLocalVideoElement,
   };
 }
