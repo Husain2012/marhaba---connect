@@ -102,15 +102,54 @@ app.get('/api/ice-servers', async (req, res) => {
     .split(',')
     .map((u) => u.trim())
     .filter(Boolean);
+  let turnConfigured = false;
   if (turnUrls.length > 0 && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) {
     iceServers.push({
       urls: turnUrls,
       username: process.env.TURN_USERNAME,
       credential: process.env.TURN_CREDENTIAL,
     });
+    turnConfigured = true;
   }
 
-  res.json({ iceServers });
+  const meteredDomain = (process.env.METERED_DOMAIN || '').trim();
+  const meteredApiKey = (process.env.METERED_API_KEY || '').trim();
+  if (meteredDomain && meteredApiKey && /^[a-zA-Z0-9.-]+$/.test(meteredDomain)) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 2500);
+      const turnResp = await fetch(
+        `https://${meteredDomain}/api/v1/turn/credentials?apiKey=${encodeURIComponent(meteredApiKey)}`,
+        { signal: controller.signal }
+      );
+      clearTimeout(timer);
+      if (turnResp.ok) {
+        const dynamicServers = (await turnResp.json()) as Array<{
+          urls?: string | string[];
+          username?: string;
+          credential?: string;
+        }>;
+        if (Array.isArray(dynamicServers)) {
+          for (const srv of dynamicServers) {
+            if (srv?.urls) {
+              iceServers.push({
+                urls: srv.urls,
+                ...(srv.username ? { username: srv.username } : {}),
+                ...(srv.credential ? { credential: srv.credential } : {}),
+              });
+              if (srv.username && srv.credential) {
+                turnConfigured = true;
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // Continue with STUN + any static TURN configured
+    }
+  }
+
+  res.json({ iceServers, turnConfigured });
 });
 
 // --- Web Push (VAPID) setup & subscription store ---
@@ -626,6 +665,8 @@ wss.on('connection', (ws, req) => {
     if (
       type === 'call:offer' ||
       type === 'call:answer' ||
+      type === 'call:renegotiate' ||
+      type === 'call:renegotiate-answer' ||
       type === 'call:ice' ||
       type === 'call:decline' ||
       type === 'call:hangup' ||

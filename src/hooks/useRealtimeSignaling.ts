@@ -138,8 +138,12 @@ export function useRealtimeSignaling({
   const ringtoneTimerRef = useRef<number | null>(null);
   const ringtoneCtxRef = useRef<AudioContext | null>(null);
   const iceFailTimerRef = useRef<number | null>(null);
+  const iceDisconnectTimerRef = useRef<number | null>(null);
   const relayFallbackTimerRef = useRef<number | null>(null);
   const iceRestartedRef = useRef<boolean>(false);
+  const iceRestartInFlightRef = useRef<boolean>(false);
+  const iceRestartCountRef = useRef<number>(0);
+  const lastIceRestartAtRef = useRef<number>(0);
   const webrtcConnectedRef = useRef<boolean>(false);
   const isMutedRef = useRef<boolean>(false);
   const isCameraOffRef = useRef<boolean>(false);
@@ -275,14 +279,14 @@ export function useRealtimeSignaling({
 
     const sr = ctx.sampleRate || 48000;
     const ringState: PlaybackRingState = {
-      ring: new Float32Array(sr * 2),
+      ring: new Float32Array(sr * 3),
       writePos: 0,
       readPos: 0,
       available: 0,
       buffering: true,
       lastSample: 0,
-      prebufferTarget: Math.round(sr * 0.16), // 160ms jitter cushion for SIM 4G/5G
-      maxBuffered: Math.round(sr * 0.55),
+      prebufferTarget: Math.round(sr * 0.26), // 260ms jitter cushion for SIM 4G/5G handoffs
+      maxBuffered: Math.round(sr * 0.85),
     };
     playbackRingRef.current = ringState;
 
@@ -352,9 +356,16 @@ export function useRealtimeSignaling({
 
   const closePeerConnectionOnly = useCallback(() => {
     webrtcConnectedRef.current = false;
+    iceRestartInFlightRef.current = false;
+    iceRestartCountRef.current = 0;
+    lastIceRestartAtRef.current = 0;
     if (iceFailTimerRef.current !== null) {
       window.clearTimeout(iceFailTimerRef.current);
       iceFailTimerRef.current = null;
+    }
+    if (iceDisconnectTimerRef.current !== null) {
+      window.clearTimeout(iceDisconnectTimerRef.current);
+      iceDisconnectTimerRef.current = null;
     }
     if (pcRef.current) {
       pcRef.current.onicecandidate = null;
@@ -465,7 +476,7 @@ export function useRealtimeSignaling({
             }
             captureQueueRef.current = [];
             const source = captureCtx.createMediaStreamSource(stream);
-            const processor = captureCtx.createScriptProcessor(4096, 1, 1);
+            const processor = captureCtx.createScriptProcessor(2048, 1, 1);
             const silentGain = captureCtx.createGain();
             silentGain.gain.value = 0;
 
@@ -639,11 +650,18 @@ export function useRealtimeSignaling({
           state.available = Math.min(ringLen, state.available + outCount);
         }
 
-        // Keep latency bounded if cellular packets arrive in a burst
+        // Keep latency bounded smoothly if cellular packets arrive in a burst
         if (state.available > state.maxBuffered) {
-          const drop = state.available - state.prebufferTarget;
+          const targetKeep = Math.round(outRate * 0.36);
+          const drop = state.available - targetKeep;
           state.readPos = (state.readPos + drop) % ringLen;
           state.available -= drop;
+          // Apply a tiny 32-sample micro-fade at the new read head to prevent audible clicks
+          const fadeSamples = Math.min(32, state.available);
+          for (let f = 0; f < fadeSamples; f += 1) {
+            const idx = (state.readPos + f) % ringLen;
+            state.ring[idx] *= f / fadeSamples;
+          }
         }
       } catch {
         // Skip malformed frame
@@ -687,6 +705,9 @@ export function useRealtimeSignaling({
     stopRelayMedia();
     closePeerConnectionOnly();
     iceRestartedRef.current = false;
+    iceRestartInFlightRef.current = false;
+    iceRestartCountRef.current = 0;
+    lastIceRestartAtRef.current = 0;
 
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((track) => track.stop());
@@ -712,13 +733,19 @@ export function useRealtimeSignaling({
   }, [closePeerConnectionOnly, stopRelayMedia, stopRingtone]);
 
   const fetchIceConfiguration = useCallback(async (): Promise<RTCConfiguration> => {
+    const baseOpts: Partial<RTCConfiguration> = {
+      iceCandidatePoolSize: 10,
+      iceTransportPolicy: 'all',
+      bundlePolicy: 'max-bundle',
+      rtcpMuxPolicy: 'require',
+    };
     if (!user) {
-      return { iceServers: DEFAULT_ICE_SERVERS, iceCandidatePoolSize: 10 };
+      return { iceServers: DEFAULT_ICE_SERVERS, ...baseOpts };
     }
     try {
       const token = await user.getIdToken();
       const controller = new AbortController();
-      const timer = window.setTimeout(() => controller.abort(), 1600);
+      const timer = window.setTimeout(() => controller.abort(), 3000);
       const resp = await fetch('/api/ice-servers', {
         headers: { Authorization: `Bearer ${token}` },
         signal: controller.signal,
@@ -727,13 +754,13 @@ export function useRealtimeSignaling({
       if (resp.ok) {
         const data = (await resp.json()) as { iceServers?: RTCIceServer[] };
         if (Array.isArray(data.iceServers) && data.iceServers.length > 0) {
-          return { iceServers: data.iceServers, iceCandidatePoolSize: 10 };
+          return { iceServers: data.iceServers, ...baseOpts };
         }
       }
     } catch {
       // Fallback to default STUN list
     }
-    return { iceServers: DEFAULT_ICE_SERVERS, iceCandidatePoolSize: 10 };
+    return { iceServers: DEFAULT_ICE_SERVERS, ...baseOpts };
   }, [user]);
 
   const drainPendingIce = useCallback(async (callId: string, pc: RTCPeerConnection) => {
@@ -745,12 +772,67 @@ export function useRealtimeSignaling({
     }
   }, []);
 
+  const triggerIceRestart = useCallback(
+    async (callId: string, peerUid: string): Promise<boolean> => {
+      const pc = pcRef.current;
+      const cur = activeCallRef.current;
+      if (!pc || !cur || cur.callId !== callId || isRelayActiveRef.current) {
+        return false;
+      }
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+        return false;
+      }
+      if (iceRestartInFlightRef.current || iceRestartCountRef.current >= 3) {
+        return false;
+      }
+      const now = Date.now();
+      if (now - lastIceRestartAtRef.current < 3000) {
+        return false;
+      }
+
+      iceRestartInFlightRef.current = true;
+      lastIceRestartAtRef.current = now;
+      iceRestartCountRef.current += 1;
+      iceRestartedRef.current = true;
+
+      try {
+        if (typeof pc.restartIce === 'function') {
+          pc.restartIce();
+        }
+        const offer = await pc.createOffer({
+          iceRestart: true,
+          offerToReceiveAudio: true,
+          offerToReceiveVideo: cur.callType === 'video',
+        });
+        if (pcRef.current !== pc || activeCallRef.current?.callId !== callId) {
+          return false;
+        }
+        await pc.setLocalDescription(offer);
+        sendWs({
+          type: 'call:renegotiate',
+          callId,
+          toUid: peerUid,
+          sdp: pc.localDescription || offer,
+        });
+        return true;
+      } catch {
+        return false;
+      } finally {
+        iceRestartInFlightRef.current = false;
+      }
+    },
+    [sendWs]
+  );
+
   const createPeerConnection = useCallback(
     (callId: string, peerUid: string, callType: CallType, rtcConfig: RTCConfiguration) => {
       const pc = new RTCPeerConnection(rtcConfig);
       const remote = new MediaStream();
       remoteStreamRef.current = remote;
       iceRestartedRef.current = false;
+      iceRestartInFlightRef.current = false;
+      iceRestartCountRef.current = 0;
+      lastIceRestartAtRef.current = 0;
       webrtcConnectedRef.current = false;
 
       const emitRemoteStream = async () => {
@@ -772,6 +854,23 @@ export function useRealtimeSignaling({
             track.onunmute = () => void emitRemoteStream();
           }
         }
+
+        // Raise WebRTC jitter buffer slightly on audio receivers to absorb cellular packet jitter
+        pc.getReceivers().forEach((receiver) => {
+          if (receiver.track?.kind === 'audio') {
+            const r = receiver as RTCRtpReceiver & {
+              playoutDelayHint?: number;
+              jitterBufferTarget?: number;
+            };
+            try {
+              if ('jitterBufferTarget' in r) r.jitterBufferTarget = 220;
+              if ('playoutDelayHint' in r) r.playoutDelayHint = 0.22;
+            } catch {
+              // Ignore unsupported browser hints
+            }
+          }
+        });
+
         void emitRemoteStream();
       };
 
@@ -789,9 +888,14 @@ export function useRealtimeSignaling({
       const markConnected = async () => {
         if (isRelayActiveRef.current) return;
         webrtcConnectedRef.current = true;
+        iceRestartCountRef.current = 0;
         if (iceFailTimerRef.current !== null) {
           window.clearTimeout(iceFailTimerRef.current);
           iceFailTimerRef.current = null;
+        }
+        if (iceDisconnectTimerRef.current !== null) {
+          window.clearTimeout(iceDisconnectTimerRef.current);
+          iceDisconnectTimerRef.current = null;
         }
         // Only mark P2P active once WebRTC actually has real inbound media bytes
         const hasRealBytes = await hasWebRtcInboundMediaBytes(pc, callType === 'video');
@@ -819,26 +923,75 @@ export function useRealtimeSignaling({
         }
       };
 
+      const handleDisconnectOrFailure = async (isHardFailure: boolean) => {
+        const cur = activeCallRef.current;
+        if (!cur || cur.callId !== callId || isRelayActiveRef.current || pcRef.current !== pc) {
+          return;
+        }
+        const restarted = await triggerIceRestart(callId, peerUid);
+        if (iceFailTimerRef.current !== null) {
+          window.clearTimeout(iceFailTimerRef.current);
+        }
+        if (!restarted && isHardFailure) {
+          handlePossibleFailure();
+          return;
+        }
+        iceFailTimerRef.current = window.setTimeout(() => {
+          if (
+            pcRef.current === pc &&
+            !isRelayActiveRef.current &&
+            pc.iceConnectionState !== 'connected' &&
+            pc.iceConnectionState !== 'completed'
+          ) {
+            handlePossibleFailure();
+          }
+        }, isHardFailure ? 4500 : 5500);
+      };
+
       pc.onconnectionstatechange = () => {
         if (pc.connectionState === 'connected') {
           void markConnected();
+        } else if (pc.connectionState === 'disconnected') {
+          if (iceDisconnectTimerRef.current === null) {
+            iceDisconnectTimerRef.current = window.setTimeout(() => {
+              iceDisconnectTimerRef.current = null;
+              if (
+                pcRef.current === pc &&
+                (pc.connectionState === 'disconnected' || pc.iceConnectionState === 'disconnected')
+              ) {
+                void handleDisconnectOrFailure(false);
+              }
+            }, 900);
+          }
         } else if (pc.connectionState === 'failed') {
-          handlePossibleFailure();
+          void handleDisconnectOrFailure(true);
         }
       };
 
       pc.oniceconnectionstatechange = () => {
         if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
           void markConnected();
+        } else if (pc.iceConnectionState === 'disconnected') {
+          if (iceDisconnectTimerRef.current === null) {
+            iceDisconnectTimerRef.current = window.setTimeout(() => {
+              iceDisconnectTimerRef.current = null;
+              if (
+                pcRef.current === pc &&
+                (pc.iceConnectionState === 'disconnected' || pc.connectionState === 'disconnected')
+              ) {
+                void handleDisconnectOrFailure(false);
+              }
+            }, 900);
+          }
         } else if (pc.iceConnectionState === 'failed') {
-          handlePossibleFailure();
+          void handleDisconnectOrFailure(true);
         }
       };
 
       pcRef.current = pc;
       return pc;
     },
-    [sendWs, startRelayMedia, stopRelayMedia, stopRingtone]
+    [sendWs, startRelayMedia, stopRingtone, triggerIceRestart]
   );
 
   // Connect & maintain WebSocket signaling + relay
@@ -852,6 +1005,8 @@ export function useRealtimeSignaling({
     let cancelled = false;
     let reconnectTimeout: number | null = null;
     let pingInterval: number | null = null;
+    let networkProbeTimeout: number | null = null;
+    let lastWsActivityAt = Date.now();
 
     const connect = async () => {
       if (cancelled) return;
@@ -860,6 +1015,7 @@ export function useRealtimeSignaling({
       wsRef.current = ws;
 
       ws.onopen = async () => {
+        lastWsActivityAt = Date.now();
         try {
           const token = await user.getIdToken();
           if (ws.readyState === WebSocket.OPEN) {
@@ -877,6 +1033,7 @@ export function useRealtimeSignaling({
       };
 
       ws.onmessage = async (event) => {
+        lastWsActivityAt = Date.now();
         let msg: Record<string, unknown>;
         try {
           msg = JSON.parse(String(event.data)) as Record<string, unknown>;
@@ -886,6 +1043,14 @@ export function useRealtimeSignaling({
 
         const type = msg.type;
         if (type === 'pong') return;
+
+        if (type === 'auth:ok') {
+          const cur = activeCallRef.current;
+          if (cur && pcRef.current && !isRelayActiveRef.current) {
+            void triggerIceRestart(cur.callId, cur.peerUid);
+          }
+          return;
+        }
 
         if (type === 'presence:list' && Array.isArray(msg.onlineUids)) {
           setOnlineUids(msg.onlineUids.map(String));
@@ -980,6 +1145,57 @@ export function useRealtimeSignaling({
           return;
         }
 
+        if (type === 'call:renegotiate') {
+          const callId = String(msg.callId || '');
+          const fromUid = String(msg.fromUid || '');
+          const sdp = msg.sdp as RTCSessionDescriptionInit | undefined;
+          const pc = pcRef.current;
+          const cur = activeCallRef.current;
+          if (!pc || !cur || cur.callId !== callId || !sdp || isRelayActiveRef.current) {
+            return;
+          }
+          try {
+            const isPolite = Boolean(user?.uid && fromUid && user.uid < fromUid);
+            if (pc.signalingState !== 'stable') {
+              if (!isPolite) {
+                return;
+              }
+              await pc.setLocalDescription({ type: 'rollback' }).catch(() => undefined);
+            }
+            await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+            await drainPendingIce(callId, pc);
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            sendWs({
+              type: 'call:renegotiate-answer',
+              callId,
+              toUid: fromUid,
+              sdp: pc.localDescription || answer,
+            });
+          } catch {
+            // Ignore transient renegotiation error; relay safety timer still protects call
+          }
+          return;
+        }
+
+        if (type === 'call:renegotiate-answer') {
+          const callId = String(msg.callId || '');
+          const sdp = msg.sdp as RTCSessionDescriptionInit | undefined;
+          const pc = pcRef.current;
+          if (!pc || activeCallRef.current?.callId !== callId || !sdp || isRelayActiveRef.current) {
+            return;
+          }
+          try {
+            if (pc.signalingState === 'have-local-offer') {
+              await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+              await drainPendingIce(callId, pc);
+            }
+          } catch {
+            // Ignore transient answer error
+          }
+          return;
+        }
+
         if (type === 'call:ice') {
           const callId = String(msg.callId || '');
           const candidate = msg.candidate as RTCIceCandidateInit | undefined;
@@ -1044,22 +1260,80 @@ export function useRealtimeSignaling({
           pingInterval = null;
         }
         if (!cancelled) {
+          const delayMs = activeCallRef.current ? 400 : 2500;
           reconnectTimeout = window.setTimeout(() => {
             void connect();
-          }, 2500);
+          }, delayMs);
         }
       };
     };
+
+    const handleNetworkChange = () => {
+      const cur = activeCallRef.current;
+      if (!cur) return;
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        try {
+          ws?.close();
+        } catch {
+          // ignore
+        }
+        return;
+      }
+
+      // Probe WebSocket liveness: if old IP left TCP half-open, force immediate reconnect on new IP
+      const probeSentAt = Date.now();
+      try {
+        ws.send(JSON.stringify({ type: 'ping' }));
+      } catch {
+        ws.close();
+        return;
+      }
+      if (networkProbeTimeout !== null) {
+        window.clearTimeout(networkProbeTimeout);
+      }
+      networkProbeTimeout = window.setTimeout(() => {
+        networkProbeTimeout = null;
+        if (!cancelled && wsRef.current === ws && lastWsActivityAt < probeSentAt) {
+          try {
+            ws.close();
+          } catch {
+            // ignore
+          }
+        }
+      }, 900);
+
+      if (pcRef.current && !isRelayActiveRef.current) {
+        void triggerIceRestart(cur.callId, cur.peerUid);
+      }
+    };
+
+    const netConn = (
+      navigator as Navigator & {
+        connection?: {
+          addEventListener?: (type: string, listener: () => void) => void;
+          removeEventListener?: (type: string, listener: () => void) => void;
+        };
+      }
+    ).connection;
+
+    window.addEventListener('online', handleNetworkChange);
+    netConn?.addEventListener?.('change', handleNetworkChange);
 
     void connect();
 
     return () => {
       cancelled = true;
+      window.removeEventListener('online', handleNetworkChange);
+      netConn?.removeEventListener?.('change', handleNetworkChange);
       if (reconnectTimeout !== null) {
         window.clearTimeout(reconnectTimeout);
       }
       if (pingInterval !== null) {
         window.clearInterval(pingInterval);
+      }
+      if (networkProbeTimeout !== null) {
+        window.clearTimeout(networkProbeTimeout);
       }
       wsRef.current?.close();
       wsRef.current = null;
@@ -1073,6 +1347,7 @@ export function useRealtimeSignaling({
     startRelayMedia,
     startRingtone,
     stopRingtone,
+    triggerIceRestart,
     user,
   ]);
 
