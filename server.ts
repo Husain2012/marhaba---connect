@@ -4,13 +4,15 @@ import http from 'node:http';
 import path from 'node:path';
 import dotenv from 'dotenv';
 import express from 'express';
+import { generateVAPIDKeys, sendNotification, setVapidDetails } from 'web-push';
 import { WebSocket, WebSocketServer } from 'ws';
 
 dotenv.config();
 
 const PORT = Number(process.env.PORT) || 3000;
 const app = express();
-const uploadsDir = path.resolve(process.cwd(), '.data', 'uploads');
+const dataDir = path.resolve(process.cwd(), '.data');
+const uploadsDir = path.resolve(dataDir, 'uploads');
 fs.mkdirSync(uploadsDir, { recursive: true });
 
 // Load Firebase web config for ID token verification via Identity Toolkit
@@ -111,6 +113,291 @@ app.get('/api/ice-servers', async (req, res) => {
   res.json({ iceServers });
 });
 
+// --- Web Push (VAPID) setup & subscription store ---
+interface StoredPushSubscription {
+  endpoint: string;
+  keys: { p256dh: string; auth: string };
+  lang: 'ar' | 'en';
+  updatedAt: number;
+}
+
+const vapidFilePath = path.resolve(dataDir, 'vapid.json');
+const pushSubsFilePath = path.resolve(dataDir, 'push-subscriptions.json');
+
+function initVapidKeys(): { publicKey: string; privateKey: string; subject: string } {
+  const envPub = (process.env.VAPID_PUBLIC_KEY || '').trim();
+  const envPriv = (process.env.VAPID_PRIVATE_KEY || '').trim();
+  const subject = (process.env.VAPID_SUBJECT || 'mailto:support@marhabaconnect.app').trim();
+
+  if (envPub && envPriv) {
+    return { publicKey: envPub, privateKey: envPriv, subject };
+  }
+
+  try {
+    if (fs.existsSync(vapidFilePath)) {
+      const parsed = JSON.parse(fs.readFileSync(vapidFilePath, 'utf-8')) as {
+        publicKey?: string;
+        privateKey?: string;
+      };
+      if (parsed.publicKey && parsed.privateKey) {
+        return { publicKey: parsed.publicKey, privateKey: parsed.privateKey, subject };
+      }
+    }
+  } catch {
+    // Regenerate below if unreadable
+  }
+
+  const generated = generateVAPIDKeys();
+  try {
+    fs.writeFileSync(vapidFilePath, JSON.stringify(generated, null, 2));
+  } catch {
+    // Ignore read-only fs errors; keeps keys in memory
+  }
+  return { publicKey: generated.publicKey, privateKey: generated.privateKey, subject };
+}
+
+const vapidConfig = initVapidKeys();
+setVapidDetails(vapidConfig.subject, vapidConfig.publicKey, vapidConfig.privateKey);
+
+const pushSubsByUid = new Map<string, StoredPushSubscription[]>();
+
+function loadPushSubs() {
+  try {
+    if (!fs.existsSync(pushSubsFilePath)) return;
+    const raw = JSON.parse(fs.readFileSync(pushSubsFilePath, 'utf-8')) as Record<string, StoredPushSubscription[]>;
+    for (const [uid, list] of Object.entries(raw)) {
+      if (Array.isArray(list) && list.length > 0) {
+        pushSubsByUid.set(uid, list.slice(0, 8));
+      }
+    }
+  } catch {
+    // Ignore corrupt cache
+  }
+}
+
+function savePushSubs() {
+  try {
+    const obj: Record<string, StoredPushSubscription[]> = {};
+    for (const [uid, list] of pushSubsByUid.entries()) {
+      if (list.length > 0) obj[uid] = list;
+    }
+    fs.writeFileSync(pushSubsFilePath, JSON.stringify(obj));
+  } catch {
+    // Ignore fs errors
+  }
+}
+
+loadPushSubs();
+
+function isSafePushEndpoint(endpoint: string): boolean {
+  if (!endpoint || endpoint.length > 2048) return false;
+  try {
+    const u = new URL(endpoint);
+    if (u.protocol !== 'https:') return false;
+    const host = u.hostname.toLowerCase();
+    if (
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host === '::1' ||
+      host.startsWith('10.') ||
+      host.startsWith('192.168.') ||
+      host.startsWith('169.254.') ||
+      /^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
+    ) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function sendWebPushToUser(
+  targetUid: string,
+  buildPayload: (lang: 'ar' | 'en') => Record<string, unknown>,
+  options?: { urgency?: 'high' | 'normal'; ttl?: number }
+) {
+  const subs = pushSubsByUid.get(targetUid);
+  if (!subs || subs.length === 0) return;
+
+  const remaining: StoredPushSubscription[] = [];
+  let changed = false;
+
+  await Promise.all(
+    subs.map(async (sub) => {
+      try {
+        const payload = JSON.stringify(buildPayload(sub.lang));
+        await sendNotification(
+          {
+            endpoint: sub.endpoint,
+            keys: sub.keys,
+          },
+          payload,
+          {
+            TTL: options?.ttl ?? 60,
+            urgency: options?.urgency ?? 'high',
+          }
+        );
+        remaining.push(sub);
+      } catch (err: unknown) {
+        const statusCode = (err as { statusCode?: number }).statusCode;
+        if (statusCode === 404 || statusCode === 410) {
+          changed = true;
+        } else {
+          remaining.push(sub);
+        }
+      }
+    })
+  );
+
+  if (changed) {
+    if (remaining.length > 0) {
+      pushSubsByUid.set(targetUid, remaining);
+    } else {
+      pushSubsByUid.delete(targetUid);
+    }
+    savePushSubs();
+  }
+}
+
+// Public VAPID key for browser push subscription
+app.get('/api/push/vapid-public-key', (_req, res) => {
+  res.json({ publicKey: vapidConfig.publicKey });
+});
+
+// Save authenticated user's Web Push subscription
+app.post('/api/push/subscribe', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  const verified = await verifyFirebaseIdToken(token);
+  if (!verified) {
+    res.status(401).json({ error: 'Authentication required' });
+    return;
+  }
+
+  const body = req.body as {
+    subscription?: { endpoint?: unknown; keys?: { p256dh?: unknown; auth?: unknown } };
+    lang?: unknown;
+  };
+  const endpoint = typeof body?.subscription?.endpoint === 'string' ? body.subscription.endpoint.trim() : '';
+  const p256dh = typeof body?.subscription?.keys?.p256dh === 'string' ? body.subscription.keys.p256dh.trim() : '';
+  const authKey = typeof body?.subscription?.keys?.auth === 'string' ? body.subscription.keys.auth.trim() : '';
+  const lang: 'ar' | 'en' = body?.lang === 'en' ? 'en' : 'ar';
+
+  if (!isSafePushEndpoint(endpoint) || !p256dh || p256dh.length > 512 || !authKey || authKey.length > 512) {
+    res.status(400).json({ error: 'Invalid push subscription' });
+    return;
+  }
+
+  const existing = pushSubsByUid.get(verified.uid) || [];
+  const filtered = existing.filter((s) => s.endpoint !== endpoint);
+  filtered.unshift({
+    endpoint,
+    keys: { p256dh, auth: authKey },
+    lang,
+    updatedAt: Date.now(),
+  });
+  pushSubsByUid.set(verified.uid, filtered.slice(0, 8));
+  savePushSubs();
+  res.json({ ok: true });
+});
+
+// Remove push subscription on sign out
+app.post('/api/push/unsubscribe', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  const verified = await verifyFirebaseIdToken(token);
+  if (!verified) {
+    res.status(401).json({ error: 'Authentication required' });
+    return;
+  }
+
+  const body = req.body as { endpoint?: unknown };
+  const endpoint = typeof body?.endpoint === 'string' ? body.endpoint.trim() : '';
+  if (endpoint) {
+    const existing = pushSubsByUid.get(verified.uid) || [];
+    const next = existing.filter((s) => s.endpoint !== endpoint);
+    if (next.length > 0) {
+      pushSubsByUid.set(verified.uid, next);
+    } else {
+      pushSubsByUid.delete(verified.uid);
+    }
+    savePushSubs();
+  }
+  res.json({ ok: true });
+});
+
+// Authenticated background push trigger when sending a chat message
+app.post('/api/push/notify-message', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  const verified = await verifyFirebaseIdToken(token);
+  if (!verified) {
+    res.status(401).json({ error: 'Authentication required' });
+    return;
+  }
+
+  const body = req.body as {
+    chatId?: unknown;
+    recipientUids?: unknown;
+    senderName?: unknown;
+    messageType?: unknown;
+    previewText?: unknown;
+    isEncrypted?: unknown;
+  };
+
+  const chatId = typeof body.chatId === 'string' ? body.chatId.slice(0, 128) : '';
+  const senderName =
+    typeof body.senderName === 'string' && body.senderName.trim()
+      ? body.senderName.trim().slice(0, 80)
+      : verified.name || 'Marhaba Connect';
+  const messageType = typeof body.messageType === 'string' ? body.messageType : 'text';
+  const isEncrypted = Boolean(body.isEncrypted);
+  const rawPreview = typeof body.previewText === 'string' ? body.previewText.trim().slice(0, 160) : '';
+  const recipientUids = Array.isArray(body.recipientUids)
+    ? body.recipientUids
+        .filter((id): id is string => typeof id === 'string' && id.length > 0 && id.length <= 128 && id !== verified.uid)
+        .slice(0, 50)
+    : [];
+
+  if (!chatId || recipientUids.length === 0) {
+    res.json({ ok: true, sent: 0 });
+    return;
+  }
+
+  await Promise.all(
+    recipientUids.map((uid) =>
+      sendWebPushToUser(
+        uid,
+        (lang) => {
+          let notifBody = rawPreview;
+          if (messageType === 'audio') {
+            notifBody = lang === 'ar' ? '🎤 رسالة صوتية جديدة' : '🎤 New voice message';
+          } else if (messageType === 'image') {
+            notifBody = lang === 'ar' ? '📷 أرسل صورة' : '📷 Sent a photo';
+          } else if (messageType === 'file') {
+            notifBody = lang === 'ar' ? '📎 أرسل ملفاً' : '📎 Sent a file';
+          } else if (isEncrypted || !notifBody) {
+            notifBody = lang === 'ar' ? '🔒 رسالة جديدة مشفرة' : '🔒 New encrypted message';
+          }
+          return {
+            type: 'message',
+            title: senderName,
+            body: notifBody,
+            tag: `chat_${chatId}`,
+            chatId,
+            url: `/?chat=${encodeURIComponent(chatId)}`,
+            requireInteraction: false,
+          };
+        },
+        { urgency: 'high', ttl: 300 }
+      )
+    )
+  );
+
+  res.json({ ok: true });
+});
+
 // Authenticated file/media upload endpoint
 app.post('/api/upload', async (req, res) => {
   const authHeader = req.headers.authorization;
@@ -208,6 +495,38 @@ const wss = new WebSocketServer({ server, path: '/ws', perMessageDeflate: false 
 const socketsByUid = new Map<string, Set<WebSocket>>();
 const uidBySocket = new Map<WebSocket, string>();
 
+// Short-lived pending call offer buffer (45s TTL) so offline callees opening via push still receive the call
+interface PendingCallOffer {
+  callId: string;
+  toUid: string;
+  offerPayload: Record<string, unknown>;
+  icePayloads: Array<Record<string, unknown>>;
+  createdAt: number;
+}
+const pendingCallsByCallee = new Map<string, Map<string, PendingCallOffer>>();
+
+function cleanupExpiredPendingCalls() {
+  const now = Date.now();
+  for (const [calleeUid, map] of pendingCallsByCallee.entries()) {
+    for (const [callId, entry] of map.entries()) {
+      if (now - entry.createdAt > 45000) {
+        map.delete(callId);
+      }
+    }
+    if (map.size === 0) {
+      pendingCallsByCallee.delete(calleeUid);
+    }
+  }
+}
+
+function clearPendingCall(callId: string) {
+  for (const [calleeUid, map] of pendingCallsByCallee.entries()) {
+    if (map.delete(callId) && map.size === 0) {
+      pendingCallsByCallee.delete(calleeUid);
+    }
+  }
+}
+
 function sendJson(ws: WebSocket, payload: unknown) {
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(payload));
@@ -271,6 +590,18 @@ wss.on('connection', (ws, req) => {
       socketsByUid.get(verified.uid)!.add(ws);
       sendJson(ws, { type: 'auth:ok', uid: verified.uid });
       broadcastPresence();
+
+      // Replay any fresh pending incoming call offer + ICE candidates if callee just launched from push notification
+      cleanupExpiredPendingCalls();
+      const pendingForMe = pendingCallsByCallee.get(verified.uid);
+      if (pendingForMe) {
+        for (const entry of pendingForMe.values()) {
+          sendJson(ws, entry.offerPayload);
+          for (const ice of entry.icePayloads) {
+            sendJson(ws, ice);
+          }
+        }
+      }
       return;
     }
 
@@ -302,14 +633,62 @@ wss.on('connection', (ws, req) => {
     ) {
       const toUid = typeof msg.toUid === 'string' ? msg.toUid : '';
       if (!toUid) return;
-      sendToUser(
-        toUid,
-        {
-          ...msg,
-          fromUid: senderUid,
-        },
-        ws
-      );
+      const callId = typeof msg.callId === 'string' ? msg.callId : '';
+      const outbound = {
+        ...msg,
+        fromUid: senderUid,
+      };
+      sendToUser(toUid, outbound, ws);
+
+      if (type === 'call:offer' && callId) {
+        cleanupExpiredPendingCalls();
+        if (!pendingCallsByCallee.has(toUid)) {
+          pendingCallsByCallee.set(toUid, new Map());
+        }
+        pendingCallsByCallee.get(toUid)!.set(callId, {
+          callId,
+          toUid,
+          offerPayload: outbound,
+          icePayloads: [],
+          createdAt: Date.now(),
+        });
+
+        const callerName =
+          typeof msg.callerName === 'string' && msg.callerName.trim()
+            ? msg.callerName.trim().slice(0, 80)
+            : 'Marhaba Connect';
+        const callType = msg.callType === 'video' ? 'video' : 'audio';
+        const chatId = typeof msg.chatId === 'string' ? msg.chatId : '';
+
+        void sendWebPushToUser(
+          toUid,
+          (lang) => ({
+            type: 'call',
+            title: callerName,
+            body:
+              callType === 'video'
+                ? lang === 'ar'
+                  ? '📹 مكالمة مرئية واردة — اضغط للرد'
+                  : '📹 Incoming video call — tap to answer'
+                : lang === 'ar'
+                  ? '📞 مكالمة صوتية واردة — اضغط للرد'
+                  : '📞 Incoming audio call — tap to answer',
+            tag: `call_${callId}`,
+            callId,
+            chatId,
+            url: chatId ? `/?chat=${encodeURIComponent(chatId)}` : '/',
+            requireInteraction: true,
+          }),
+          { urgency: 'high', ttl: 45 }
+        );
+      } else if (type === 'call:ice' && callId) {
+        const entry = pendingCallsByCallee.get(toUid)?.get(callId);
+        if (entry && entry.icePayloads.length < 40) {
+          entry.icePayloads.push(outbound);
+        }
+      } else if ((type === 'call:answer' || type === 'call:decline' || type === 'call:hangup') && callId) {
+        clearPendingCall(callId);
+      }
       return;
     }
 

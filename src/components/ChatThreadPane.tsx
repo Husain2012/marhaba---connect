@@ -24,6 +24,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { getCopy } from '../i18n/translations';
 import { sendChatMessage, uploadMediaFile } from '../lib/chatService';
 import { decryptDirectText, E2eeKeyPairData, encryptDirectText } from '../lib/e2ee';
+import { sendBackgroundMessagePush } from '../lib/pushNotifications';
 import { CallType, Chat, ChatMessage, Language, UserPublic } from '../types/chat';
 import { Avatar } from './Avatar';
 
@@ -253,6 +254,28 @@ export function ChatThreadPane({
     }, 2200);
   };
 
+  const notifyRecipients = async (params: {
+    messageType: 'text' | 'image' | 'file' | 'audio';
+    previewText?: string;
+    isEncrypted?: boolean;
+  }) => {
+    const recipientUids = chat.memberIds.filter((id) => id !== currentUid);
+    if (recipientUids.length === 0) return;
+    try {
+      const token = await getIdToken();
+      await sendBackgroundMessagePush(token, {
+        chatId: chat.id,
+        recipientUids,
+        senderName: currentDisplayName,
+        messageType: params.messageType,
+        previewText: params.previewText,
+        isEncrypted: params.isEncrypted,
+      });
+    } catch {
+      // Ignore background push errors so chat stays instantaneous
+    }
+  };
+
   const handleSendText = async () => {
     const clean = draft.trim();
     if (!clean) return;
@@ -274,6 +297,7 @@ export function ChatThreadPane({
         recipientKeyY: encrypted.recipientKeyY,
         replyToId: currentReply?.id || '',
       });
+      void notifyRecipients({ messageType: 'text', isEncrypted: true });
     } else {
       await sendChatMessage(chat.id, currentUid, currentDisplayName, chat.memberIds, {
         type: 'text',
@@ -281,6 +305,11 @@ export function ChatThreadPane({
         replyToId: currentReply?.id || '',
         replyToPreview: currentReply ? (currentReply.displayText || currentReply.fileName || currentReply.type).slice(0, 140) : '',
         previewLabel: clean,
+      });
+      void notifyRecipients({
+        messageType: 'text',
+        isEncrypted: false,
+        previewText: clean.slice(0, 120),
       });
     }
   };
@@ -313,6 +342,7 @@ export function ChatThreadPane({
         mimeType: uploaded.mimeType,
         previewLabel: kind === 'image' ? `📷 ${t.imageLabel}` : `📎 ${uploaded.fileName}`,
       });
+      void notifyRecipients({ messageType: kind, previewText: uploaded.fileName });
     } catch {
       setUploadError(t.uploadError);
     } finally {
@@ -369,6 +399,7 @@ export function ChatThreadPane({
           audioDurationSec: duration,
           previewLabel: `🎤 ${t.voiceMessageLabel} (${formatDuration(duration)})`,
         });
+        void notifyRecipients({ messageType: 'audio' });
       } catch {
         setUploadError(t.uploadError);
       } finally {

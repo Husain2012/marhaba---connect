@@ -347,6 +347,12 @@ export function SettingsPane({
             })}
           </div>
 
+          {permissions.notifications === 'granted' && (
+            <p className="text-[11px] text-[#00B87C] leading-relaxed">
+              {t.permissions.backgroundPushActive}
+            </p>
+          )}
+
           {(permissions.microphone === 'denied' ||
             permissions.camera === 'denied' ||
             permissions.notifications === 'denied') && (

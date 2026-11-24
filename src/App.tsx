@@ -32,6 +32,7 @@ import {
 import { E2eeKeyPairData, getOrCreateMyE2eeKeys } from './lib/e2ee';
 import { auth, googleProvider } from './lib/firebase';
 import { AppPermissionsState, queryAppPermissions } from './lib/permissions';
+import { syncWebPushSubscription, unsubscribeWebPush } from './lib/pushNotifications';
 import {
   CallRecord,
   CallType,
@@ -173,6 +174,52 @@ function MainApp() {
     };
   }, [authReady, user]);
 
+  // Sync Web Push subscription whenever signed in and notification permission is granted
+  useEffect(() => {
+    if (!authReady || !user || permissions.notifications !== 'granted') return;
+    let cancelled = false;
+    void user
+      .getIdToken()
+      .then((token) => {
+        if (!cancelled && token) {
+          return syncWebPushSubscription(token, language);
+        }
+        return false;
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [authReady, language, permissions.notifications, user]);
+
+  // Open target chat when launched from a background push notification (?chat=...) or SW message
+  useEffect(() => {
+    if (!authReady || !user) return;
+    const params = new URLSearchParams(window.location.search);
+    const targetChatId = params.get('chat');
+    if (targetChatId) {
+      setActiveTab('chats');
+      setActiveChatId(targetChatId);
+      params.delete('chat');
+      const nextQuery = params.toString();
+      const nextUrl = `${window.location.pathname}${nextQuery ? `?${nextQuery}` : ''}${window.location.hash}`;
+      window.history.replaceState({}, '', nextUrl);
+    }
+  }, [authReady, user]);
+
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return;
+    const handleSwMessage = (event: MessageEvent) => {
+      const payload = event.data as { type?: string; data?: { chatId?: string } } | null;
+      if (payload?.type === 'notification:open' && payload.data?.chatId) {
+        setActiveTab('chats');
+        setActiveChatId(payload.data.chatId);
+      }
+    };
+    navigator.serviceWorker.addEventListener('message', handleSwMessage);
+    return () => navigator.serviceWorker.removeEventListener('message', handleSwMessage);
+  }, []);
+
   // Hydrate public profiles ONLY for peers in your active chats, calls, or saved contacts
   useEffect(() => {
     if (!user) return;
@@ -295,6 +342,10 @@ function MainApp() {
 
   const handleSignOut = async () => {
     if (user) {
+      const token = await user.getIdToken().catch(() => '');
+      if (token) {
+        await unsubscribeWebPush(token).catch(() => undefined);
+      }
       await updateUserProfile(user.uid, { isOnline: false }).catch(() => undefined);
     }
     await signOut(auth);
