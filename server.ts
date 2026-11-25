@@ -759,7 +759,9 @@ wss.on('connection', (ws, req) => {
       const toUid = typeof msg.toUid === 'string' ? msg.toUid : '';
       const callId = typeof msg.callId === 'string' ? msg.callId : '';
       const frame = typeof msg.frame === 'string' ? msg.frame : '';
-      if (!toUid || !callId || !frame || frame.length > 220000 || !frame.startsWith('data:image/jpeg;base64,')) {
+      const isSupportedFrame =
+        frame.startsWith('data:image/webp;base64,') || frame.startsWith('data:image/jpeg;base64,');
+      if (!toUid || !callId || !frame || frame.length > 220000 || !isSupportedFrame) {
         return;
       }
       // Drop video frames aggressively on any downlink backlog so live audio stays jitter-free

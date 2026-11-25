@@ -978,7 +978,7 @@ export function useRealtimeSignaling({
         void startAudioCapture();
       }
 
-      // 2. Live video frame capture directly from visible preview <video> (or DOM fallback)
+      // 2. Live video frame capture: sharp WebP (fallback JPEG) + adaptive motion throttling for minimal data usage
       if (callType === 'video') {
         try {
           let hiddenVideo: HTMLVideoElement | null = null;
@@ -1010,6 +1010,19 @@ export function useRealtimeSignaling({
 
           const canvas = document.createElement('canvas');
           const ctx = canvas.getContext('2d');
+          const probeCanvas = document.createElement('canvas');
+          probeCanvas.width = 16;
+          probeCanvas.height = 12;
+          const probeCtx = probeCanvas.getContext('2d', { willReadFrequently: true });
+          let prevLuma: Uint8Array | null = null;
+          let lastSentAt = 0;
+
+          // Detect WebP encoder support once (WebP gives much cleaner faces at ~35% smaller size than JPEG)
+          canvas.width = 2;
+          canvas.height = 2;
+          const preferWebp = canvas.toDataURL('image/webp', 0.5).startsWith('data:image/webp;base64,');
+          const mime = preferWebp ? 'image/webp' : 'image/jpeg';
+          const quality = preferWebp ? 0.54 : 0.48;
 
           relayVideoTimerRef.current = window.setInterval(() => {
             if (!isRelayActiveRef.current || isCameraOffRef.current) return;
@@ -1018,7 +1031,7 @@ export function useRealtimeSignaling({
             const liveTrack = localStreamRef.current?.getVideoTracks()[0];
             if (!liveTrack || liveTrack.readyState !== 'live') return;
             // Strictly prioritize live 40ms voice frames over video frames on cellular uplinks
-            if (wsRef.current && wsRef.current.bufferedAmount > 12000) return;
+            if (wsRef.current && wsRef.current.bufferedAmount > 10000) return;
 
             const previewEl = localPreviewVideoElRef.current;
             const sourceEl =
@@ -1030,13 +1043,46 @@ export function useRealtimeSignaling({
               return;
             }
 
-            const maxW = 192;
+            const now = Date.now();
+            // Skip redundant frames when user is still to save mobile data, sending at least 1 keyframe every ~1.2s
+            if (probeCtx && prevLuma && now - lastSentAt < 1150) {
+              probeCtx.drawImage(sourceEl, 0, 0, 16, 12);
+              const data = probeCtx.getImageData(0, 0, 16, 12).data;
+              let diffSum = 0;
+              for (let i = 0, p = 0; i < data.length; i += 4, p += 1) {
+                const y = (data[i] * 3 + data[i + 1] * 4 + data[i + 2]) >> 3;
+                diffSum += Math.abs(y - prevLuma[p]);
+              }
+              const avgDiff = diffSum / 192;
+              // Low motion: wait at least 680ms between frames (~1.5fps); moderate motion: ~340ms (~3fps)
+              if (avgDiff < 4.5 && now - lastSentAt < 680) {
+                return;
+              }
+              for (let i = 0, p = 0; i < data.length; i += 4, p += 1) {
+                prevLuma[p] = (data[i] * 3 + data[i + 1] * 4 + data[i + 2]) >> 3;
+              }
+            } else if (probeCtx) {
+              probeCtx.drawImage(sourceEl, 0, 0, 16, 12);
+              const data = probeCtx.getImageData(0, 0, 16, 12).data;
+              if (!prevLuma) prevLuma = new Uint8Array(192);
+              for (let i = 0, p = 0; i < data.length; i += 4, p += 1) {
+                prevLuma[p] = (data[i] * 3 + data[i + 1] * 4 + data[i + 2]) >> 3;
+              }
+            }
+
+            const maxW = 288;
             const scale = Math.min(1, maxW / sourceEl.videoWidth);
             canvas.width = Math.max(1, Math.round(sourceEl.videoWidth * scale));
             canvas.height = Math.max(1, Math.round(sourceEl.videoHeight * scale));
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'medium';
             ctx.drawImage(sourceEl, 0, 0, canvas.width, canvas.height);
-            const frame = canvas.toDataURL('image/jpeg', 0.34);
-            if (frame && frame.startsWith('data:image/jpeg;base64,')) {
+            const frame = canvas.toDataURL(mime, quality);
+            if (
+              frame &&
+              (frame.startsWith('data:image/webp;base64,') || frame.startsWith('data:image/jpeg;base64,'))
+            ) {
+              lastSentAt = now;
               sendWs({
                 type: 'call:relay-video',
                 callId,
@@ -1044,7 +1090,7 @@ export function useRealtimeSignaling({
                 frame,
               });
             }
-          }, 260);
+          }, 340);
         } catch {
           // Ignore canvas capture error
         }
@@ -1833,7 +1879,30 @@ export function useRealtimeSignaling({
     [sendWs]
   );
 
-  // Resilient getUserMedia with Samsung / Android constraint fallbacks
+  // Cap WebRTC video sender bitrate & preserve crisp resolution on limited data plans (never touches audio)
+  const tuneLowDataVideoSenders = useCallback((pc: RTCPeerConnection | null) => {
+    if (!pc) return;
+    pc.getSenders().forEach((sender) => {
+      if (sender.track?.kind !== 'video') return;
+      try {
+        if ('contentHint' in sender.track) {
+          sender.track.contentHint = 'motion';
+        }
+        const params = sender.getParameters();
+        if (!params.encodings || params.encodings.length === 0) {
+          params.encodings = [{}];
+        }
+        params.encodings[0].maxBitrate = 180_000; // ~1.3 MB/min max while keeping 480x360 crisp
+        params.encodings[0].maxFramerate = 15;
+        params.degradationPreference = 'maintain-resolution';
+        void sender.setParameters(params).catch(() => undefined);
+      } catch {
+        // Ignore browsers that restrict sender parameter updates
+      }
+    });
+  }, []);
+
+  // Resilient getUserMedia tuned for clear picture on weak devices & low mobile data usage
   const acquireUserMedia = useCallback(async (wantVideo: boolean): Promise<MediaStream | null> => {
     if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
       return null;
@@ -1843,13 +1912,25 @@ export function useRealtimeSignaling({
       try {
         return await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-          video: { facingMode: 'user', width: { ideal: 960 }, height: { ideal: 540 } },
+          video: {
+            facingMode: 'user',
+            width: { ideal: 480, max: 640 },
+            height: { ideal: 360, max: 480 },
+            frameRate: { ideal: 15, max: 18 },
+          },
         });
       } catch {
         try {
-          return await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+          return await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+            video: { facingMode: 'user', width: { ideal: 480 }, height: { ideal: 360 } },
+          });
         } catch {
-          // Camera blocked or unavailable: continue with audio so voice still works
+          try {
+            return await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+          } catch {
+            // Camera blocked or unavailable: continue with audio so voice still works
+          }
         }
       }
     }
@@ -1922,6 +2003,7 @@ export function useRealtimeSignaling({
       const rtcConfig = await fetchIceConfiguration();
       const pc = createPeerConnection(callId, params.peerUid, params.callType, rtcConfig);
       stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+      tuneLowDataVideoSenders(pc);
 
       const offer = await pc.createOffer({
         offerToReceiveAudio: true,
@@ -1952,6 +2034,7 @@ export function useRealtimeSignaling({
       onlineUids,
       sendWs,
       startRingtone,
+      tuneLowDataVideoSenders,
       unlockAudioEngines,
       user,
     ]
@@ -1983,6 +2066,7 @@ export function useRealtimeSignaling({
     const rtcConfig = await fetchIceConfiguration();
     const pc = createPeerConnection(call.callId, call.peerUid, call.callType, rtcConfig);
     stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+    tuneLowDataVideoSenders(pc);
 
     await pc.setRemoteDescription(new RTCSessionDescription(offerData.sdp));
     await drainPendingIce(call.callId, pc);
@@ -2008,6 +2092,7 @@ export function useRealtimeSignaling({
     scheduleRelayFallback,
     sendWs,
     stopRingtone,
+    tuneLowDataVideoSenders,
     unlockAudioEngines,
   ]);
 
@@ -2068,7 +2153,12 @@ export function useRealtimeSignaling({
       // If camera initially failed or wasn't acquired, try acquiring camera now
       try {
         const camStream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+          video: {
+            facingMode: 'user',
+            width: { ideal: 480, max: 640 },
+            height: { ideal: 360, max: 480 },
+            frameRate: { ideal: 15, max: 18 },
+          },
           audio: false,
         });
         const newTrack = camStream.getVideoTracks()[0];
@@ -2078,6 +2168,7 @@ export function useRealtimeSignaling({
           setIsCameraOff(false);
           if (pcRef.current) {
             pcRef.current.addTrack(newTrack, stream);
+            tuneLowDataVideoSenders(pcRef.current);
           }
         }
       } catch {
@@ -2090,7 +2181,7 @@ export function useRealtimeSignaling({
       t.enabled = !nextOff;
     });
     setIsCameraOff(nextOff);
-  }, [isCameraOff, onMediaError]);
+  }, [isCameraOff, onMediaError, tuneLowDataVideoSenders]);
 
   return {
     onlineUids,
