@@ -17,6 +17,241 @@ const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
 const TARGET_SAMPLE_RATE = 16000;
 const AUDIO_PACKET_SAMPLES = 640; // 40ms steady frames at 16kHz
 
+const RELAY_WORKLET_CODE = `
+class MarhabaCaptureProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.targetRate = 16000;
+    this.packetSamples = 640;
+    this.muted = false;
+    this.phase = 0;
+    this.prevSample = 0;
+    this.inited = false;
+    this.outBuf = new Int16Array(this.packetSamples);
+    this.outIdx = 0;
+    this.port.onmessage = (e) => {
+      const d = e.data;
+      if (!d) return;
+      if (d.type === 'mute') {
+        this.muted = Boolean(d.muted);
+        if (this.muted) {
+          this.outIdx = 0;
+          this.inited = false;
+        }
+      } else if (d.type === 'config') {
+        if (typeof d.targetRate === 'number' && d.targetRate >= 8000) {
+          this.targetRate = d.targetRate;
+        }
+        if (typeof d.packetSamples === 'number' && d.packetSamples >= 160) {
+          this.packetSamples = d.packetSamples;
+          this.outBuf = new Int16Array(this.packetSamples);
+          this.outIdx = 0;
+        }
+      }
+    };
+  }
+  emitSample(val) {
+    const s = val > 1 ? 1 : val < -1 ? -1 : val;
+    this.outBuf[this.outIdx++] = s < 0 ? (s * 0x8000) | 0 : (s * 0x7fff) | 0;
+    if (this.outIdx >= this.packetSamples) {
+      const payload = new Int16Array(this.outBuf);
+      this.port.postMessage({ type: 'frame', buffer: payload.buffer }, [payload.buffer]);
+      this.outIdx = 0;
+    }
+  }
+  process(inputs) {
+    const input = inputs[0] && inputs[0][0];
+    if (!input || input.length === 0 || this.muted) return true;
+    const inRate = sampleRate || 48000;
+    if (inRate <= this.targetRate) {
+      for (let i = 0; i < input.length; i += 1) {
+        this.emitSample(input[i]);
+      }
+      return true;
+    }
+    const step = inRate / this.targetRate;
+    let phase = this.inited ? this.phase : 0;
+    const prev = this.inited ? this.prevSample : input[0];
+    this.inited = true;
+    while (phase < input.length - 1) {
+      const idx = Math.floor(phase);
+      const frac = phase - idx;
+      const s0 = idx < 0 ? prev : input[idx];
+      const s1 = input[idx + 1];
+      this.emitSample(s0 + (s1 - s0) * frac);
+      phase += step;
+    }
+    this.prevSample = input[input.length - 1];
+    this.phase = phase - input.length;
+    return true;
+  }
+}
+
+class MarhabaPlaybackProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    const sr = sampleRate || 48000;
+    this.sr = sr;
+    this.ring = new Float32Array(sr * 3);
+    this.writePos = 0;
+    this.readPos = 0;
+    this.available = 0;
+    this.initialPrebuffering = true;
+    this.gain = 1;
+    this.lastSample = 0;
+    this.initialTarget = Math.round(sr * 0.20);
+    this.lowWater = Math.round(sr * 0.13);
+    this.highWater = Math.round(sr * 0.44);
+    this.maxBuffered = Math.round(sr * 1.1);
+    this.resPhase = 0;
+    this.resPrev = 0;
+    this.resInited = false;
+    this.port.onmessage = (e) => {
+      const d = e.data;
+      if (!d) return;
+      if (d.type === 'reset') {
+        this.writePos = 0;
+        this.readPos = 0;
+        this.available = 0;
+        this.initialPrebuffering = true;
+        this.gain = 1;
+        this.lastSample = 0;
+        this.resPhase = 0;
+        this.resPrev = 0;
+        this.resInited = false;
+        return;
+      }
+      if (d.type === 'push' && d.buffer) {
+        const raw = new Float32Array(d.buffer);
+        if (raw.length === 0) return;
+        const inRate = d.sr >= 8000 && d.sr <= 48000 ? d.sr : 16000;
+        const outRate = this.sr;
+        const ringLen = this.ring.length;
+        if (inRate === outRate) {
+          for (let i = 0; i < raw.length; i += 1) {
+            this.ring[this.writePos] = raw[i];
+            this.writePos = (this.writePos + 1) % ringLen;
+          }
+          this.available = Math.min(ringLen, this.available + raw.length);
+        } else {
+          const step = inRate / outRate;
+          let phase = this.resInited ? this.resPhase : 0;
+          const prev = this.resInited ? this.resPrev : raw[0];
+          this.resInited = true;
+          while (phase < raw.length - 1) {
+            const idx = Math.floor(phase);
+            const frac = phase - idx;
+            const s0 = idx < 0 ? prev : raw[idx];
+            const s1 = raw[idx + 1];
+            this.ring[this.writePos] = s0 + (s1 - s0) * frac;
+            this.writePos = (this.writePos + 1) % ringLen;
+            this.available = Math.min(ringLen, this.available + 1);
+            phase += step;
+          }
+          this.resPrev = raw[raw.length - 1];
+          this.resPhase = phase - raw.length;
+        }
+        if (this.available > this.maxBuffered) {
+          const targetKeep = Math.round(outRate * 0.28);
+          const drop = Math.floor(this.available - targetKeep);
+          this.readPos = (this.readPos + drop) % ringLen;
+          this.available -= drop;
+          this.gain = Math.min(this.gain, 0.35);
+        }
+      }
+    };
+  }
+  process(_inputs, outputs) {
+    const out = outputs[0] && outputs[0][0];
+    if (!out) return true;
+    if (this.initialPrebuffering) {
+      if (this.available < this.initialTarget) {
+        for (let i = 0; i < out.length; i += 1) {
+          this.lastSample *= 0.96;
+          out[i] = this.lastSample;
+        }
+        return true;
+      }
+      this.initialPrebuffering = false;
+    }
+    const len = this.ring.length;
+    const rate =
+      this.available > this.highWater
+        ? 1.03
+        : this.available < this.lowWater
+          ? 0.97
+          : 1.0;
+    for (let i = 0; i < out.length; i += 1) {
+      if (this.available >= 2) {
+        const i0 = Math.floor(this.readPos);
+        const frac = this.readPos - i0;
+        const s0 = this.ring[i0];
+        const s1 = this.ring[(i0 + 1) % len];
+        const rawSample = s0 + (s1 - s0) * frac;
+        let sample = rawSample;
+        if (this.gain < 1) {
+          this.gain = Math.min(1, this.gain + 1 / 96);
+          sample = this.lastSample * (1 - this.gain) + rawSample * this.gain;
+        }
+        out[i] = sample;
+        this.lastSample = sample;
+        this.readPos = (this.readPos + rate) % len;
+        this.available = Math.max(0, this.available - rate);
+      } else {
+        this.lastSample *= 0.982;
+        this.gain = Math.max(0.15, this.gain * 0.96);
+        out[i] = this.lastSample;
+      }
+    }
+    return true;
+  }
+}
+
+registerProcessor('marhaba-capture-processor', MarhabaCaptureProcessor);
+registerProcessor('marhaba-playback-processor', MarhabaPlaybackProcessor);
+`;
+
+const workletReadyByCtx = new WeakMap<AudioContext, Promise<boolean>>();
+
+function ensureRelayWorklets(ctx: AudioContext): Promise<boolean> {
+  const existing = workletReadyByCtx.get(ctx);
+  if (existing) return existing;
+  if (!ctx.audioWorklet || typeof Blob === 'undefined' || typeof URL === 'undefined') {
+    const fail = Promise.resolve(false);
+    workletReadyByCtx.set(ctx, fail);
+    return fail;
+  }
+  const promise = (async () => {
+    const blob = new Blob([RELAY_WORKLET_CODE], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    try {
+      await ctx.audioWorklet.addModule(url);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  })();
+  workletReadyByCtx.set(ctx, promise);
+  return promise;
+}
+
+function createAudioContextWithHint(hint?: AudioContextLatencyCategory): AudioContext | null {
+  const AudioCtx =
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+  if (!AudioCtx) return null;
+  if (hint) {
+    try {
+      return new AudioCtx({ latencyHint: hint });
+    } catch {
+      // Fallback for browsers rejecting options object
+    }
+  }
+  return new AudioCtx();
+}
+
 interface ResamplerState {
   phase: number;
   prevSample: number;
@@ -117,7 +352,6 @@ interface PlaybackRingState {
   readPos: number;
   available: number;
   initialPrebuffering: boolean;
-  inUnderrun: boolean;
   fadeInGain: number;
   lastSample: number;
   initialTarget: number;
@@ -169,9 +403,10 @@ export function useRealtimeSignaling({
   const isMutedRef = useRef<boolean>(false);
   const isCameraOffRef = useRef<boolean>(false);
 
-  // Pre-unlocked AudioContexts & jitter ring buffer
+  // Pre-unlocked AudioContexts & off-main-thread worklets / fallback ring buffer
   const isRelayActiveRef = useRef<boolean>(false);
   const captureCtxRef = useRef<AudioContext | null>(null);
+  const captureWorkletRef = useRef<AudioWorkletNode | null>(null);
   const captureProcRef = useRef<ScriptProcessorNode | null>(null);
   const captureSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const captureSilentGainRef = useRef<GainNode | null>(null);
@@ -179,6 +414,9 @@ export function useRealtimeSignaling({
   const captureResamplerRef = useRef<ResamplerState>({ phase: 0, prevSample: 0, inited: false });
 
   const playbackCtxRef = useRef<AudioContext | null>(null);
+  const playbackWorkletRef = useRef<AudioWorkletNode | null>(null);
+  const playbackSetupPromiseRef = useRef<Promise<void> | null>(null);
+  const playbackPreQueueRef = useRef<Array<{ raw: Float32Array; sr: number }>>([]);
   const playbackProcRef = useRef<ScriptProcessorNode | null>(null);
   const playbackDummyGainRef = useRef<GainNode | null>(null);
   const playbackKeepAliveRef = useRef<ConstantSourceNode | null>(null);
@@ -201,6 +439,11 @@ export function useRealtimeSignaling({
     isMutedRef.current = isMuted;
     if (isMuted) {
       captureQueueRef.current = [];
+    }
+    try {
+      captureWorkletRef.current?.port.postMessage({ type: 'mute', muted: isMuted });
+    } catch {
+      // ignore
     }
   }, [isMuted]);
 
@@ -257,46 +500,41 @@ export function useRealtimeSignaling({
   // Must be called synchronously inside user tap (startCall / acceptIncomingCall)
   const unlockAudioEngines = useCallback(() => {
     try {
-      const AudioCtx =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      if (!AudioCtx) return;
-
       if (!playbackCtxRef.current || playbackCtxRef.current.state === 'closed') {
-        playbackCtxRef.current = new AudioCtx();
+        playbackCtxRef.current = createAudioContextWithHint('playback');
       }
-      if (playbackCtxRef.current.state === 'suspended') {
-        void playbackCtxRef.current.resume().catch(() => undefined);
-      }
-      // Play 1 silent sample to force Android/Samsung/iOS audio unlock
-      try {
-        const silentBuf = playbackCtxRef.current.createBuffer(1, 1, 22050);
-        const src = playbackCtxRef.current.createBufferSource();
-        src.buffer = silentBuf;
-        src.connect(playbackCtxRef.current.destination);
-        src.start(0);
-      } catch {
-        // ignore
+      if (playbackCtxRef.current) {
+        if (playbackCtxRef.current.state === 'suspended') {
+          void playbackCtxRef.current.resume().catch(() => undefined);
+        }
+        void ensureRelayWorklets(playbackCtxRef.current);
+        // Play 1 silent sample to force Android/Samsung/iOS audio unlock
+        try {
+          const silentBuf = playbackCtxRef.current.createBuffer(1, 1, 22050);
+          const src = playbackCtxRef.current.createBufferSource();
+          src.buffer = silentBuf;
+          src.connect(playbackCtxRef.current.destination);
+          src.start(0);
+        } catch {
+          // ignore
+        }
       }
 
       if (!captureCtxRef.current || captureCtxRef.current.state === 'closed') {
-        captureCtxRef.current = new AudioCtx();
+        captureCtxRef.current = createAudioContextWithHint('interactive');
       }
-      if (captureCtxRef.current.state === 'suspended') {
-        void captureCtxRef.current.resume().catch(() => undefined);
+      if (captureCtxRef.current) {
+        if (captureCtxRef.current.state === 'suspended') {
+          void captureCtxRef.current.resume().catch(() => undefined);
+        }
+        void ensureRelayWorklets(captureCtxRef.current);
       }
     } catch {
       // Ignore if AudioContext unavailable
     }
   }, []);
 
-  const ensurePlaybackRingNode = useCallback(() => {
-    const ctx = playbackCtxRef.current;
-    if (!ctx || ctx.state === 'closed') return null;
-    if (ctx.state === 'suspended') {
-      void ctx.resume().catch(() => undefined);
-    }
-
+  const attachFallbackPlaybackRing = useCallback((ctx: AudioContext) => {
     if (playbackRingRef.current && playbackProcRef.current) {
       return playbackRingRef.current;
     }
@@ -308,19 +546,18 @@ export function useRealtimeSignaling({
       readPos: 0,
       available: 0,
       initialPrebuffering: true,
-      inUnderrun: false,
       fadeInGain: 1,
       lastSample: 0,
-      initialTarget: Math.round(sr * 0.14), // 140ms crisp initial cushion
-      lowWater: Math.round(sr * 0.08),      // 80ms -> gently slow 3% before running dry
-      highWater: Math.round(sr * 0.36),     // 360ms -> gently speed 3% to keep latency tight
-      maxBuffered: Math.round(sr * 0.9),
+      initialTarget: Math.round(sr * 0.20),
+      lowWater: Math.round(sr * 0.13),
+      highWater: Math.round(sr * 0.44),
+      maxBuffered: Math.round(sr * 1.1),
     };
     playbackRingRef.current = ringState;
 
     const dummyGain = ctx.createGain();
     dummyGain.gain.value = 0;
-    const proc = ctx.createScriptProcessor(1024, 1, 1);
+    const proc = ctx.createScriptProcessor(2048, 1, 1);
 
     proc.onaudioprocess = (ev) => {
       const out = ev.outputBuffer.getChannelData(0);
@@ -333,7 +570,7 @@ export function useRealtimeSignaling({
       if (state.initialPrebuffering) {
         if (state.available < state.initialTarget) {
           for (let i = 0; i < out.length; i += 1) {
-            state.lastSample *= 0.94;
+            state.lastSample *= 0.96;
             out[i] = state.lastSample;
           }
           return;
@@ -355,15 +592,12 @@ export function useRealtimeSignaling({
           const frac = state.readPos - i0;
           const s0 = state.ring[i0];
           const s1 = state.ring[(i0 + 1) % len];
-          let sample = s0 + (s1 - s0) * frac;
+          const rawSample = s0 + (s1 - s0) * frac;
+          let sample = rawSample;
 
-          if (state.inUnderrun) {
-            state.fadeInGain = 0;
-            state.inUnderrun = false;
-          }
           if (state.fadeInGain < 1) {
-            sample *= state.fadeInGain;
-            state.fadeInGain = Math.min(1, state.fadeInGain + 1 / 64);
+            state.fadeInGain = Math.min(1, state.fadeInGain + 1 / 96);
+            sample = state.lastSample * (1 - state.fadeInGain) + rawSample * state.fadeInGain;
           }
 
           out[i] = sample;
@@ -371,9 +605,9 @@ export function useRealtimeSignaling({
           state.readPos = (state.readPos + playbackRate) % len;
           state.available = Math.max(0, state.available - playbackRate);
         } else {
-          state.lastSample *= 0.94;
+          state.lastSample *= 0.982;
+          state.fadeInGain = Math.max(0.15, state.fadeInGain * 0.96);
           out[i] = state.lastSample;
-          state.inUnderrun = true;
         }
       }
     };
@@ -394,6 +628,104 @@ export function useRealtimeSignaling({
     playbackProcRef.current = proc;
     return ringState;
   }, []);
+
+  const pushRawSamplesToFallbackRing = useCallback(
+    (ctx: AudioContext, raw: Float32Array, sampleRate: number) => {
+      const state = attachFallbackPlaybackRing(ctx);
+      const inRate = sampleRate >= 8000 && sampleRate <= 48000 ? sampleRate : TARGET_SAMPLE_RATE;
+      const outRate = ctx.sampleRate || 48000;
+      const ringLen = state.ring.length;
+
+      if (inRate === outRate) {
+        for (let i = 0; i < raw.length; i += 1) {
+          state.ring[state.writePos] = raw[i];
+          state.writePos = (state.writePos + 1) % ringLen;
+        }
+        state.available = Math.min(ringLen, state.available + raw.length);
+      } else {
+        const wr = playResamplerRef.current;
+        const step = inRate / outRate;
+        let phase = wr.inited ? wr.phase : 0;
+        const prev = wr.inited ? wr.prevSample : raw[0];
+        wr.inited = true;
+
+        while (phase < raw.length - 1) {
+          const idx = Math.floor(phase);
+          const frac = phase - idx;
+          const s0 = idx < 0 ? prev : raw[idx];
+          const s1 = raw[idx + 1];
+          state.ring[state.writePos] = s0 + (s1 - s0) * frac;
+          state.writePos = (state.writePos + 1) % ringLen;
+          state.available = Math.min(ringLen, state.available + 1);
+          phase += step;
+        }
+        wr.prevSample = raw[raw.length - 1];
+        wr.phase = phase - raw.length;
+      }
+
+      if (state.available > state.maxBuffered) {
+        const targetKeep = Math.round(outRate * 0.28);
+        const drop = Math.floor(state.available - targetKeep);
+        state.readPos = (state.readPos + drop) % ringLen;
+        state.available -= drop;
+        state.fadeInGain = Math.min(state.fadeInGain, 0.35);
+      }
+    },
+    [attachFallbackPlaybackRing]
+  );
+
+  const ensurePlaybackEngine = useCallback(() => {
+    const ctx = playbackCtxRef.current;
+    if (!ctx || ctx.state === 'closed') return;
+    if (ctx.state === 'suspended') {
+      void ctx.resume().catch(() => undefined);
+    }
+    if (playbackWorkletRef.current || playbackProcRef.current || playbackSetupPromiseRef.current) {
+      return;
+    }
+
+    const setup = (async () => {
+      const ok = await ensureRelayWorklets(ctx);
+      if (!isRelayActiveRef.current || playbackCtxRef.current !== ctx || ctx.state === 'closed') {
+        return;
+      }
+
+      if (ok && typeof AudioWorkletNode !== 'undefined') {
+        try {
+          const node = new AudioWorkletNode(ctx, 'marhaba-playback-processor', {
+            numberOfInputs: 0,
+            numberOfOutputs: 1,
+            outputChannelCount: [1],
+          });
+          node.connect(ctx.destination);
+          playbackWorkletRef.current = node;
+
+          const pending = playbackPreQueueRef.current;
+          playbackPreQueueRef.current = [];
+          for (const item of pending) {
+            node.port.postMessage(
+              { type: 'push', buffer: item.raw.buffer, sr: item.sr },
+              [item.raw.buffer]
+            );
+          }
+          return;
+        } catch {
+          // Fall through to ScriptProcessor fallback
+        }
+      }
+
+      attachFallbackPlaybackRing(ctx);
+      const pending = playbackPreQueueRef.current;
+      playbackPreQueueRef.current = [];
+      for (const item of pending) {
+        pushRawSamplesToFallbackRing(ctx, item.raw, item.sr);
+      }
+    })().finally(() => {
+      playbackSetupPromiseRef.current = null;
+    });
+
+    playbackSetupPromiseRef.current = setup;
+  }, [attachFallbackPlaybackRing, pushRawSamplesToFallbackRing]);
 
   const sendWs = useCallback((payload: unknown) => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -431,6 +763,8 @@ export function useRealtimeSignaling({
     captureQueueRef.current = [];
     captureResamplerRef.current = { phase: 0, prevSample: 0, inited: false };
     playResamplerRef.current = { phase: 0, prevSample: 0, inited: false };
+    playbackSetupPromiseRef.current = null;
+    playbackPreQueueRef.current = [];
     if (relayFallbackTimerRef.current !== null) {
       window.clearTimeout(relayFallbackTimerRef.current);
       relayFallbackTimerRef.current = null;
@@ -443,6 +777,15 @@ export function useRealtimeSignaling({
       offscreenVideoRef.current.srcObject = null;
       offscreenVideoRef.current.remove();
       offscreenVideoRef.current = null;
+    }
+    if (captureWorkletRef.current) {
+      captureWorkletRef.current.port.onmessage = null;
+      try {
+        captureWorkletRef.current.disconnect();
+      } catch {
+        // ignore
+      }
+      captureWorkletRef.current = null;
     }
     if (captureProcRef.current) {
       captureProcRef.current.onaudioprocess = null;
@@ -478,6 +821,15 @@ export function useRealtimeSignaling({
       }
       playbackKeepAliveRef.current = null;
     }
+    if (playbackWorkletRef.current) {
+      try {
+        playbackWorkletRef.current.port.postMessage({ type: 'reset' });
+        playbackWorkletRef.current.disconnect();
+      } catch {
+        // ignore
+      }
+      playbackWorkletRef.current = null;
+    }
     if (playbackProcRef.current) {
       playbackProcRef.current.onaudioprocess = null;
       try {
@@ -512,33 +864,77 @@ export function useRealtimeSignaling({
       closePeerConnectionOnly();
 
       unlockAudioEngines();
-      ensurePlaybackRingNode();
+      ensurePlaybackEngine();
 
-      // 1. Live audio PCM capture -> exact 64ms 16kHz frames over WebSocket
+      // 1. Live audio PCM capture -> off-main-thread AudioWorklet (with ScriptProcessor 2048 fallback)
       if (stream.getAudioTracks().length > 0) {
-        try {
-          const AudioCtx =
-            window.AudioContext ||
-            (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-          const captureCtx =
-            captureCtxRef.current && captureCtxRef.current.state !== 'closed'
-              ? captureCtxRef.current
-              : AudioCtx
-                ? new AudioCtx()
-                : null;
+        const startAudioCapture = async () => {
+          try {
+            const captureCtx =
+              captureCtxRef.current && captureCtxRef.current.state !== 'closed'
+                ? captureCtxRef.current
+                : createAudioContextWithHint('interactive');
 
-          if (captureCtx) {
+            if (!captureCtx || !isRelayActiveRef.current || activeCallRef.current?.callId !== callId) {
+              return;
+            }
             captureCtxRef.current = captureCtx;
             if (captureCtx.state === 'suspended') {
               void captureCtx.resume().catch(() => undefined);
             }
+
             captureQueueRef.current = [];
             captureResamplerRef.current = { phase: 0, prevSample: 0, inited: false };
+
+            const workletReady = await ensureRelayWorklets(captureCtx);
+            if (!isRelayActiveRef.current || activeCallRef.current?.callId !== callId) {
+              return;
+            }
+
             const source = captureCtx.createMediaStreamSource(stream);
-            const processor = captureCtx.createScriptProcessor(1024, 1, 1);
             const silentGain = captureCtx.createGain();
             silentGain.gain.value = 0;
+            captureSourceRef.current = source;
+            captureSilentGainRef.current = silentGain;
 
+            if (workletReady && typeof AudioWorkletNode !== 'undefined') {
+              try {
+                const worklet = new AudioWorkletNode(captureCtx, 'marhaba-capture-processor', {
+                  numberOfInputs: 1,
+                  numberOfOutputs: 1,
+                  outputChannelCount: [1],
+                });
+                worklet.port.postMessage({
+                  type: 'config',
+                  targetRate: TARGET_SAMPLE_RATE,
+                  packetSamples: AUDIO_PACKET_SAMPLES,
+                });
+                worklet.port.postMessage({ type: 'mute', muted: isMutedRef.current });
+                worklet.port.onmessage = (ev) => {
+                  if (!isRelayActiveRef.current || isMutedRef.current) return;
+                  if (activeCallRef.current?.callId !== callId) return;
+                  const buf = (ev.data as { buffer?: ArrayBuffer } | null)?.buffer;
+                  if (!buf) return;
+                  const pcm = int16ToBase64(new Int16Array(buf));
+                  sendWs({
+                    type: 'call:relay-audio',
+                    callId,
+                    toUid: peerUid,
+                    sr: TARGET_SAMPLE_RATE,
+                    pcm,
+                  });
+                };
+                source.connect(worklet);
+                worklet.connect(silentGain);
+                silentGain.connect(captureCtx.destination);
+                captureWorkletRef.current = worklet;
+                return;
+              } catch {
+                // Fall back cleanly to ScriptProcessor below
+              }
+            }
+
+            const processor = captureCtx.createScriptProcessor(2048, 1, 1);
             processor.onaudioprocess = (ev) => {
               if (!isRelayActiveRef.current || isMutedRef.current) return;
               if (activeCallRef.current?.callId !== callId) return;
@@ -574,13 +970,12 @@ export function useRealtimeSignaling({
             source.connect(processor);
             processor.connect(silentGain);
             silentGain.connect(captureCtx.destination);
-            captureSourceRef.current = source;
             captureProcRef.current = processor;
-            captureSilentGainRef.current = silentGain;
+          } catch {
+            // Ignore if audio capture node fails
           }
-        } catch {
-          // Ignore if audio capture node fails
-        }
+        };
+        void startAudioCapture();
       }
 
       // 2. Live video frame capture directly from visible preview <video> (or DOM fallback)
@@ -622,8 +1017,8 @@ export function useRealtimeSignaling({
             if (!ctx) return;
             const liveTrack = localStreamRef.current?.getVideoTracks()[0];
             if (!liveTrack || liveTrack.readyState !== 'live') return;
-            // Strictly prioritize live audio over video frames on slower cellular uplinks
-            if (wsRef.current && wsRef.current.bufferedAmount > 24000) return;
+            // Strictly prioritize live 40ms voice frames over video frames on cellular uplinks
+            if (wsRef.current && wsRef.current.bufferedAmount > 12000) return;
 
             const previewEl = localPreviewVideoElRef.current;
             const sourceEl =
@@ -635,12 +1030,12 @@ export function useRealtimeSignaling({
               return;
             }
 
-            const maxW = 200;
+            const maxW = 192;
             const scale = Math.min(1, maxW / sourceEl.videoWidth);
             canvas.width = Math.max(1, Math.round(sourceEl.videoWidth * scale));
             canvas.height = Math.max(1, Math.round(sourceEl.videoHeight * scale));
             ctx.drawImage(sourceEl, 0, 0, canvas.width, canvas.height);
-            const frame = canvas.toDataURL('image/jpeg', 0.38);
+            const frame = canvas.toDataURL('image/jpeg', 0.34);
             if (frame && frame.startsWith('data:image/jpeg;base64,')) {
               sendWs({
                 type: 'call:relay-video',
@@ -649,7 +1044,7 @@ export function useRealtimeSignaling({
                 frame,
               });
             }
-          }, 220);
+          }, 260);
         } catch {
           // Ignore canvas capture error
         }
@@ -666,7 +1061,7 @@ export function useRealtimeSignaling({
       });
       void updateCallStatus(callId, 'active', 0);
     },
-    [closePeerConnectionOnly, ensurePlaybackRingNode, sendWs, stopRingtone, unlockAudioEngines]
+    [closePeerConnectionOnly, ensurePlaybackEngine, sendWs, stopRingtone, unlockAudioEngines]
   );
 
   const playRelayAudio = useCallback(
@@ -680,57 +1075,34 @@ export function useRealtimeSignaling({
         void ctx.resume().catch(() => undefined);
       }
 
-      const state = ensurePlaybackRingNode();
-      if (!state) return;
-
       try {
         const raw = base64ToFloat32(pcmB64);
         if (raw.length === 0) return;
+        const sr = sampleRate >= 8000 && sampleRate <= 48000 ? sampleRate : TARGET_SAMPLE_RATE;
 
-        const inRate = sampleRate >= 8000 && sampleRate <= 48000 ? sampleRate : TARGET_SAMPLE_RATE;
-        const outRate = ctx.sampleRate || 48000;
-        const ringLen = state.ring.length;
-
-        if (inRate === outRate) {
-          for (let i = 0; i < raw.length; i += 1) {
-            state.ring[state.writePos] = raw[i];
-            state.writePos = (state.writePos + 1) % ringLen;
-          }
-          state.available = Math.min(ringLen, state.available + raw.length);
-        } else {
-          const wr = playResamplerRef.current;
-          const step = inRate / outRate;
-          let phase = wr.inited ? wr.phase : 0;
-          const prev = wr.inited ? wr.prevSample : raw[0];
-          wr.inited = true;
-
-          while (phase < raw.length - 1) {
-            const idx = Math.floor(phase);
-            const frac = phase - idx;
-            const s0 = idx < 0 ? prev : raw[idx];
-            const s1 = raw[idx + 1];
-            state.ring[state.writePos] = s0 + (s1 - s0) * frac;
-            state.writePos = (state.writePos + 1) % ringLen;
-            state.available = Math.min(ringLen, state.available + 1);
-            phase += step;
-          }
-          wr.prevSample = raw[raw.length - 1];
-          wr.phase = phase - raw.length;
+        if (playbackWorkletRef.current) {
+          playbackWorkletRef.current.port.postMessage(
+            { type: 'push', buffer: raw.buffer, sr },
+            [raw.buffer]
+          );
+          return;
         }
 
-        // Only hard-trim if a severe cellular burst queued > 900ms at once
-        if (state.available > state.maxBuffered) {
-          const targetKeep = Math.round(outRate * 0.3);
-          const drop = Math.floor(state.available - targetKeep);
-          state.readPos = (state.readPos + drop) % ringLen;
-          state.available -= drop;
-          state.inUnderrun = true;
+        if (playbackRingRef.current && playbackProcRef.current) {
+          pushRawSamplesToFallbackRing(ctx, raw, sr);
+          return;
         }
+
+        playbackPreQueueRef.current.push({ raw, sr });
+        if (playbackPreQueueRef.current.length > 24) {
+          playbackPreQueueRef.current.shift();
+        }
+        ensurePlaybackEngine();
       } catch {
         // Skip malformed frame
       }
     },
-    [ensurePlaybackRingNode, unlockAudioEngines]
+    [ensurePlaybackEngine, pushRawSamplesToFallbackRing, unlockAudioEngines]
   );
 
   const scheduleRelayFallback = useCallback(
@@ -898,10 +1270,34 @@ export function useRealtimeSignaling({
       lastIceRestartAtRef.current = 0;
       webrtcConnectedRef.current = false;
 
-      const emitRemoteStream = async () => {
+      const tuneAudioReceivers = () => {
+        pc.getReceivers().forEach((receiver) => {
+          if (receiver.track?.kind === 'audio') {
+            const r = receiver as RTCRtpReceiver & {
+              playoutDelayHint?: number;
+              jitterBufferTarget?: number;
+            };
+            try {
+              if ('jitterBufferTarget' in r) r.jitterBufferTarget = 260;
+              if ('playoutDelayHint' in r) r.playoutDelayHint = 0.26;
+            } catch {
+              // Ignore unsupported browser hints
+            }
+          }
+        });
+      };
+
+      const emitRemoteStream = () => {
         const tracks = remote.getTracks();
         if (tracks.length > 0 && !isRelayActiveRef.current) {
-          setRemoteStream(new MediaStream(tracks));
+          setRemoteStream((prev) => {
+            if (prev) {
+              const prevIds = prev.getTracks().map((t) => t.id).sort().join('|');
+              const nextIds = tracks.map((t) => t.id).sort().join('|');
+              if (prevIds === nextIds) return prev;
+            }
+            return new MediaStream(tracks);
+          });
         }
       };
 
@@ -914,27 +1310,12 @@ export function useRealtimeSignaling({
         for (const track of incomingTracks) {
           if (!remote.getTracks().some((t) => t.id === track.id)) {
             remote.addTrack(track);
-            track.onunmute = () => void emitRemoteStream();
+            track.onunmute = () => emitRemoteStream();
           }
         }
 
-        // Raise WebRTC jitter buffer slightly on audio receivers to absorb cellular packet jitter
-        pc.getReceivers().forEach((receiver) => {
-          if (receiver.track?.kind === 'audio') {
-            const r = receiver as RTCRtpReceiver & {
-              playoutDelayHint?: number;
-              jitterBufferTarget?: number;
-            };
-            try {
-              if ('jitterBufferTarget' in r) r.jitterBufferTarget = 220;
-              if ('playoutDelayHint' in r) r.playoutDelayHint = 0.22;
-            } catch {
-              // Ignore unsupported browser hints
-            }
-          }
-        });
-
-        void emitRemoteStream();
+        tuneAudioReceivers();
+        emitRemoteStream();
       };
 
       pc.onicecandidate = (event) => {
@@ -952,6 +1333,7 @@ export function useRealtimeSignaling({
         if (isRelayActiveRef.current) return;
         webrtcConnectedRef.current = true;
         iceRestartCountRef.current = 0;
+        tuneAudioReceivers();
         if (iceFailTimerRef.current !== null) {
           window.clearTimeout(iceFailTimerRef.current);
           iceFailTimerRef.current = null;

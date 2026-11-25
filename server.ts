@@ -739,6 +739,7 @@ wss.on('connection', (ws, req) => {
       const pcm = typeof msg.pcm === 'string' ? msg.pcm : '';
       const sr = typeof msg.sr === 'number' ? msg.sr : 16000;
       if (!toUid || !callId || !pcm || pcm.length > 65536) return;
+      // Never drop voice frames for minor socket queues; video yields well before this limit
       sendToUser(
         toUid,
         {
@@ -749,7 +750,7 @@ wss.on('connection', (ws, req) => {
           pcm,
         },
         ws,
-        96 * 1024
+        512 * 1024
       );
       return;
     }
@@ -761,7 +762,7 @@ wss.on('connection', (ws, req) => {
       if (!toUid || !callId || !frame || frame.length > 220000 || !frame.startsWith('data:image/jpeg;base64,')) {
         return;
       }
-      // Drop video frames only if recipient socket is heavily backed up so audio packets stay real-time
+      // Drop video frames aggressively on any downlink backlog so live audio stays jitter-free
       sendToUser(
         toUid,
         {
@@ -771,7 +772,7 @@ wss.on('connection', (ws, req) => {
           frame,
         },
         ws,
-        256 * 1024
+        32 * 1024
       );
     }
   });

@@ -75,8 +75,12 @@ export function CallOverlay({
     onLocalVideoElement?.(videoEl);
     if (!videoEl || !localStream || !hasLocalVideo) return;
     videoEl.muted = true;
-    videoEl.srcObject = localStream;
-    void videoEl.play().catch(() => undefined);
+    if (videoEl.srcObject !== localStream) {
+      videoEl.srcObject = localStream;
+    }
+    if (videoEl.paused) {
+      void videoEl.play().catch(() => undefined);
+    }
     return () => {
       onLocalVideoElement?.(null);
     };
@@ -92,20 +96,30 @@ export function CallOverlay({
     }
 
     if (hasRemoteVideo && remoteVideoRef.current) {
-      remoteVideoRef.current.srcObject = remoteStream;
-      remoteVideoRef.current.muted = true; // Keep <video> muted so mobile autoplay never blocks video
-      void remoteVideoRef.current.play().catch(() => undefined);
+      const videoEl = remoteVideoRef.current;
+      if (videoEl.srcObject !== remoteStream) {
+        videoEl.srcObject = remoteStream;
+      }
+      videoEl.muted = true; // Keep <video> muted so mobile autoplay never blocks video
+      if (videoEl.paused) {
+        void videoEl.play().catch(() => undefined);
+      }
     }
 
     const audioEl = remoteAudioRef.current;
     if (audioEl) {
-      audioEl.srcObject = remoteStream;
+      const streamChanged = audioEl.srcObject !== remoteStream;
+      if (streamChanged) {
+        audioEl.srcObject = remoteStream;
+      }
       audioEl.muted = false;
       audioEl.volume = 1;
-      void audioEl
-        .play()
-        .then(() => setAudioBlocked(false))
-        .catch(() => setAudioBlocked(true));
+      if (streamChanged || audioEl.paused) {
+        void audioEl
+          .play()
+          .then(() => setAudioBlocked(false))
+          .catch(() => setAudioBlocked(true));
+      }
     }
   }, [remoteStream, callTransport, hasRemoteVideo, call?.status]);
 
