@@ -748,7 +748,8 @@ wss.on('connection', (ws, req) => {
           sr,
           pcm,
         },
-        ws
+        ws,
+        96 * 1024
       );
       return;
     }

@@ -15,28 +15,45 @@ const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
 ];
 
 const TARGET_SAMPLE_RATE = 16000;
-const AUDIO_PACKET_SAMPLES = 1024; // 64ms exact frames at 16kHz
+const AUDIO_PACKET_SAMPLES = 640; // 40ms steady frames at 16kHz
 
-function downsampleLinear(
+interface ResamplerState {
+  phase: number;
+  prevSample: number;
+  inited: boolean;
+}
+
+function appendDownsampledContinuous(
   input: Float32Array,
   inputRate: number,
-  targetRate: number
-): Float32Array {
+  targetRate: number,
+  state: ResamplerState,
+  outQueue: number[]
+) {
+  if (input.length === 0) return;
   if (inputRate <= targetRate) {
-    return input;
+    for (let i = 0; i < input.length; i += 1) {
+      outQueue.push(input[i]);
+    }
+    return;
   }
-  const ratio = inputRate / targetRate;
-  const outLen = Math.max(1, Math.floor(input.length / ratio));
-  const out = new Float32Array(outLen);
-  for (let i = 0; i < outLen; i += 1) {
-    const pos = i * ratio;
-    const idx = Math.floor(pos);
-    const frac = pos - idx;
-    const s0 = input[idx] ?? 0;
-    const s1 = input[Math.min(idx + 1, input.length - 1)] ?? s0;
-    out[i] = s0 + (s1 - s0) * frac;
+
+  const step = inputRate / targetRate;
+  let phase = state.inited ? state.phase : 0;
+  const prev = state.inited ? state.prevSample : input[0];
+  state.inited = true;
+
+  while (phase < input.length - 1) {
+    const idx = Math.floor(phase);
+    const frac = phase - idx;
+    const s0 = idx < 0 ? prev : input[idx];
+    const s1 = input[idx + 1];
+    outQueue.push(s0 + (s1 - s0) * frac);
+    phase += step;
   }
-  return out;
+
+  state.prevSample = input[input.length - 1];
+  state.phase = phase - input.length;
 }
 
 function int16ToBase64(int16: Int16Array): string {
@@ -99,9 +116,13 @@ interface PlaybackRingState {
   writePos: number;
   readPos: number;
   available: number;
-  buffering: boolean;
+  initialPrebuffering: boolean;
+  inUnderrun: boolean;
+  fadeInGain: number;
   lastSample: number;
-  prebufferTarget: number;
+  initialTarget: number;
+  lowWater: number;
+  highWater: number;
   maxBuffered: number;
 }
 
@@ -155,11 +176,14 @@ export function useRealtimeSignaling({
   const captureSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const captureSilentGainRef = useRef<GainNode | null>(null);
   const captureQueueRef = useRef<number[]>([]);
+  const captureResamplerRef = useRef<ResamplerState>({ phase: 0, prevSample: 0, inited: false });
 
   const playbackCtxRef = useRef<AudioContext | null>(null);
   const playbackProcRef = useRef<ScriptProcessorNode | null>(null);
   const playbackDummyGainRef = useRef<GainNode | null>(null);
+  const playbackKeepAliveRef = useRef<ConstantSourceNode | null>(null);
   const playbackRingRef = useRef<PlaybackRingState | null>(null);
+  const playResamplerRef = useRef<ResamplerState>({ phase: 0, prevSample: 0, inited: false });
 
   const relayVideoTimerRef = useRef<number | null>(null);
   const offscreenVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -283,16 +307,20 @@ export function useRealtimeSignaling({
       writePos: 0,
       readPos: 0,
       available: 0,
-      buffering: true,
+      initialPrebuffering: true,
+      inUnderrun: false,
+      fadeInGain: 1,
       lastSample: 0,
-      prebufferTarget: Math.round(sr * 0.26), // 260ms jitter cushion for SIM 4G/5G handoffs
-      maxBuffered: Math.round(sr * 0.85),
+      initialTarget: Math.round(sr * 0.14), // 140ms crisp initial cushion
+      lowWater: Math.round(sr * 0.08),      // 80ms -> gently slow 3% before running dry
+      highWater: Math.round(sr * 0.36),     // 360ms -> gently speed 3% to keep latency tight
+      maxBuffered: Math.round(sr * 0.9),
     };
     playbackRingRef.current = ringState;
 
     const dummyGain = ctx.createGain();
     dummyGain.gain.value = 0;
-    const proc = ctx.createScriptProcessor(2048, 1, 1);
+    const proc = ctx.createScriptProcessor(1024, 1, 1);
 
     proc.onaudioprocess = (ev) => {
       const out = ev.outputBuffer.getChannelData(0);
@@ -302,44 +330,63 @@ export function useRealtimeSignaling({
         return;
       }
 
-      if (state.buffering) {
-        if (state.available < state.prebufferTarget) {
+      if (state.initialPrebuffering) {
+        if (state.available < state.initialTarget) {
           for (let i = 0; i < out.length; i += 1) {
-            state.lastSample *= 0.92;
+            state.lastSample *= 0.94;
             out[i] = state.lastSample;
           }
           return;
         }
-        state.buffering = false;
+        state.initialPrebuffering = false;
       }
 
       const len = state.ring.length;
-      if (state.available >= out.length) {
-        for (let i = 0; i < out.length; i += 1) {
-          const sample = state.ring[state.readPos];
+      const playbackRate =
+        state.available > state.highWater
+          ? 1.03
+          : state.available < state.lowWater
+            ? 0.97
+            : 1.0;
+
+      for (let i = 0; i < out.length; i += 1) {
+        if (state.available >= 2) {
+          const i0 = Math.floor(state.readPos);
+          const frac = state.readPos - i0;
+          const s0 = state.ring[i0];
+          const s1 = state.ring[(i0 + 1) % len];
+          let sample = s0 + (s1 - s0) * frac;
+
+          if (state.inUnderrun) {
+            state.fadeInGain = 0;
+            state.inUnderrun = false;
+          }
+          if (state.fadeInGain < 1) {
+            sample *= state.fadeInGain;
+            state.fadeInGain = Math.min(1, state.fadeInGain + 1 / 64);
+          }
+
           out[i] = sample;
           state.lastSample = sample;
-          state.readPos = (state.readPos + 1) % len;
-        }
-        state.available -= out.length;
-      } else {
-        let i = 0;
-        while (i < out.length && state.available > 0) {
-          const sample = state.ring[state.readPos];
-          out[i] = sample;
-          state.lastSample = sample;
-          state.readPos = (state.readPos + 1) % len;
-          state.available -= 1;
-          i += 1;
-        }
-        while (i < out.length) {
-          state.lastSample *= 0.92;
+          state.readPos = (state.readPos + playbackRate) % len;
+          state.available = Math.max(0, state.available - playbackRate);
+        } else {
+          state.lastSample *= 0.94;
           out[i] = state.lastSample;
-          i += 1;
+          state.inUnderrun = true;
         }
-        state.buffering = true;
       }
     };
+
+    try {
+      const keepAlive = ctx.createConstantSource();
+      keepAlive.offset.value = 0;
+      keepAlive.connect(dummyGain);
+      keepAlive.start();
+      playbackKeepAliveRef.current = keepAlive;
+    } catch {
+      // Fallback without ConstantSourceNode on older engines
+    }
 
     dummyGain.connect(proc);
     proc.connect(ctx.destination);
@@ -382,6 +429,8 @@ export function useRealtimeSignaling({
   const stopRelayMedia = useCallback(() => {
     isRelayActiveRef.current = false;
     captureQueueRef.current = [];
+    captureResamplerRef.current = { phase: 0, prevSample: 0, inited: false };
+    playResamplerRef.current = { phase: 0, prevSample: 0, inited: false };
     if (relayFallbackTimerRef.current !== null) {
       window.clearTimeout(relayFallbackTimerRef.current);
       relayFallbackTimerRef.current = null;
@@ -419,6 +468,15 @@ export function useRealtimeSignaling({
         // ignore
       }
       captureSilentGainRef.current = null;
+    }
+    if (playbackKeepAliveRef.current) {
+      try {
+        playbackKeepAliveRef.current.stop();
+        playbackKeepAliveRef.current.disconnect();
+      } catch {
+        // ignore
+      }
+      playbackKeepAliveRef.current = null;
     }
     if (playbackProcRef.current) {
       playbackProcRef.current.onaudioprocess = null;
@@ -475,8 +533,9 @@ export function useRealtimeSignaling({
               void captureCtx.resume().catch(() => undefined);
             }
             captureQueueRef.current = [];
+            captureResamplerRef.current = { phase: 0, prevSample: 0, inited: false };
             const source = captureCtx.createMediaStreamSource(stream);
-            const processor = captureCtx.createScriptProcessor(2048, 1, 1);
+            const processor = captureCtx.createScriptProcessor(1024, 1, 1);
             const silentGain = captureCtx.createGain();
             silentGain.gain.value = 0;
 
@@ -485,11 +544,14 @@ export function useRealtimeSignaling({
               if (activeCallRef.current?.callId !== callId) return;
 
               const input = ev.inputBuffer.getChannelData(0);
-              const resampled = downsampleLinear(input, captureCtx.sampleRate, TARGET_SAMPLE_RATE);
               const queue = captureQueueRef.current;
-              for (let i = 0; i < resampled.length; i += 1) {
-                queue.push(resampled[i]);
-              }
+              appendDownsampledContinuous(
+                input,
+                captureCtx.sampleRate,
+                TARGET_SAMPLE_RATE,
+                captureResamplerRef.current,
+                queue
+              );
 
               while (queue.length >= AUDIO_PACKET_SAMPLES) {
                 const chunk = queue.splice(0, AUDIO_PACKET_SAMPLES);
@@ -560,8 +622,8 @@ export function useRealtimeSignaling({
             if (!ctx) return;
             const liveTrack = localStreamRef.current?.getVideoTracks()[0];
             if (!liveTrack || liveTrack.readyState !== 'live') return;
-            // Prioritize audio if WebSocket send queue is heavily backed up
-            if (wsRef.current && wsRef.current.bufferedAmount > 120000) return;
+            // Strictly prioritize live audio over video frames on slower cellular uplinks
+            if (wsRef.current && wsRef.current.bufferedAmount > 24000) return;
 
             const previewEl = localPreviewVideoElRef.current;
             const sourceEl =
@@ -573,12 +635,12 @@ export function useRealtimeSignaling({
               return;
             }
 
-            const maxW = 240;
+            const maxW = 200;
             const scale = Math.min(1, maxW / sourceEl.videoWidth);
             canvas.width = Math.max(1, Math.round(sourceEl.videoWidth * scale));
             canvas.height = Math.max(1, Math.round(sourceEl.videoHeight * scale));
             ctx.drawImage(sourceEl, 0, 0, canvas.width, canvas.height);
-            const frame = canvas.toDataURL('image/jpeg', 0.42);
+            const frame = canvas.toDataURL('image/jpeg', 0.38);
             if (frame && frame.startsWith('data:image/jpeg;base64,')) {
               sendWs({
                 type: 'call:relay-video',
@@ -587,7 +649,7 @@ export function useRealtimeSignaling({
                 frame,
               });
             }
-          }, 180);
+          }, 220);
         } catch {
           // Ignore canvas capture error
         }
@@ -636,32 +698,33 @@ export function useRealtimeSignaling({
           }
           state.available = Math.min(ringLen, state.available + raw.length);
         } else {
-          const ratio = inRate / outRate;
-          const outCount = Math.max(1, Math.round(raw.length / ratio));
-          for (let i = 0; i < outCount; i += 1) {
-            const pos = i * ratio;
-            const idx = Math.floor(pos);
-            const frac = pos - idx;
-            const s0 = raw[idx] ?? 0;
-            const s1 = raw[Math.min(idx + 1, raw.length - 1)] ?? s0;
+          const wr = playResamplerRef.current;
+          const step = inRate / outRate;
+          let phase = wr.inited ? wr.phase : 0;
+          const prev = wr.inited ? wr.prevSample : raw[0];
+          wr.inited = true;
+
+          while (phase < raw.length - 1) {
+            const idx = Math.floor(phase);
+            const frac = phase - idx;
+            const s0 = idx < 0 ? prev : raw[idx];
+            const s1 = raw[idx + 1];
             state.ring[state.writePos] = s0 + (s1 - s0) * frac;
             state.writePos = (state.writePos + 1) % ringLen;
+            state.available = Math.min(ringLen, state.available + 1);
+            phase += step;
           }
-          state.available = Math.min(ringLen, state.available + outCount);
+          wr.prevSample = raw[raw.length - 1];
+          wr.phase = phase - raw.length;
         }
 
-        // Keep latency bounded smoothly if cellular packets arrive in a burst
+        // Only hard-trim if a severe cellular burst queued > 900ms at once
         if (state.available > state.maxBuffered) {
-          const targetKeep = Math.round(outRate * 0.36);
-          const drop = state.available - targetKeep;
+          const targetKeep = Math.round(outRate * 0.3);
+          const drop = Math.floor(state.available - targetKeep);
           state.readPos = (state.readPos + drop) % ringLen;
           state.available -= drop;
-          // Apply a tiny 32-sample micro-fade at the new read head to prevent audible clicks
-          const fadeSamples = Math.min(32, state.available);
-          for (let f = 0; f < fadeSamples; f += 1) {
-            const idx = (state.readPos + f) % ringLen;
-            state.ring[idx] *= f / fadeSamples;
-          }
+          state.inUnderrun = true;
         }
       } catch {
         // Skip malformed frame
@@ -900,6 +963,10 @@ export function useRealtimeSignaling({
         // Only mark P2P active once WebRTC actually has real inbound media bytes
         const hasRealBytes = await hasWebRtcInboundMediaBytes(pc, callType === 'video');
         if (hasRealBytes && !isRelayActiveRef.current) {
+          if (relayFallbackTimerRef.current !== null) {
+            window.clearTimeout(relayFallbackTimerRef.current);
+            relayFallbackTimerRef.current = null;
+          }
           setCallTransport('p2p');
           stopRingtone();
           setActiveCall((prev) => {
